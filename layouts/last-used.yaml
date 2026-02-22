@@ -1,0 +1,11 @@
+name: last-used
+meta:
+  updated_at: '2026-02-22T17:08:32.331716+00:00'
+elements:
+- id: cpu-gauge
+  position:
+    x: 50
+    y: 50
+  size:
+    width: 150
+    height: 150

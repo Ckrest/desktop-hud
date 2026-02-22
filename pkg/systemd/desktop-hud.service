@@ -1,0 +1,16 @@
+[Unit]
+Description=Desktop HUD Overlay
+After=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Systems/desktop/desktop-hud
+ExecStart=/usr/bin/python3 -m desktop_hud
+Environment=PYTHONPATH=%h/Systems/desktop/desktop-hud/src
+Environment=GI_TYPELIB_PATH=/usr/local/lib/x86_64-linux-gnu/girepository-1.0
+Environment=SYSTEMS_ROOT=%h/Systems
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

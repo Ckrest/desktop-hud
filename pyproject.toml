@@ -1,0 +1,19 @@
+[project]
+name = "desktop-hud"
+version = "0.1.0"
+description = "Configurable desktop overlay with images, videos, and graph-lib widgets on a GTK4 layer-shell surface"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+authors = [{name = "Ckrest"}]
+dependencies = [
+    "PyYAML",
+    "PyGObject",
+]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
