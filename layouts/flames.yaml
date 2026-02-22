@@ -1,0 +1,17 @@
+name: flames
+meta:
+  updated_at: '2026-02-22T00:00:00+00:00'
+  description: Alpha flame animation along bottom of screen
+elements:
+  - id: bottom-flames
+    type: video
+    source: /home/nick/Downloads/vecteezy_fire-loop-motion_21290317_keyed_alpha.mov
+    alpha: true
+    loop: true
+    position:
+      x: 0
+      y: 640
+    size:
+      width: 2560
+      height: 800
+    opacity: 0.3

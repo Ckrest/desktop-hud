@@ -107,6 +107,8 @@ class VideoElement(HudElement):
 
         pipeline_str = (
             f'filesrc location="{path}" ! decodebin ! videoconvert ! '
+            f'videoscale method=0 ! '
+            f'video/x-raw,width={self.size[0]},height={self.size[1]},format=RGBA ! '
             f"gtk4paintablesink name=sink"
         )
         pipeline = Gst.parse_launch(pipeline_str)
@@ -116,12 +118,30 @@ class VideoElement(HudElement):
 
         picture = Gtk.Picture.new()
         picture.set_size_request(*self.size)
+        picture.set_can_shrink(False)
+        # Try to disable aspect ratio maintenance
+        try:
+            picture.set_keep_aspect_ratio(False)
+        except (AttributeError, TypeError):
+            # Property may not exist in this GTK version
+            pass
         bind_state = {"tries": 0}
 
         def bind_paintable():
             paintable = sink.get_property("paintable")
             if paintable is not None:
                 picture.set_paintable(paintable)
+                # Force the paintable to fill the entire allocated space
+                try:
+                    picture.set_content_fit(Gtk.ContentFit.FILL)
+                except (AttributeError, TypeError):
+                    # Gtk.ContentFit may not be available in this GTK version
+                    try:
+                        # Alternative: try to set halign/valign to fill
+                        picture.set_halign(Gtk.Align.FILL)
+                        picture.set_valign(Gtk.Align.FILL)
+                    except:
+                        pass
                 return False
             bind_state["tries"] += 1
             if bind_state["tries"] >= 200:

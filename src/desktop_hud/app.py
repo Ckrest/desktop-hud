@@ -295,6 +295,10 @@ class HudWindow(Gtk.Window):
             frame = self.editor.register_element(elem_id, content_widget, editable=editable)
             frame.set_size_request(width, height)
 
+            log.info("Positioning element '%s' at (%d, %d) with size %dx%d",
+                     elem_id, x, y, width, height)
+            log.info("Viewport size: %dx%d", *self.get_viewport_size())
+
             self.container.put(frame, x, y)
 
             element.position = (x, y)
@@ -307,6 +311,16 @@ class HudWindow(Gtk.Window):
                 source=source,
                 editable=editable,
             )
+
+            # Verify position was actually applied
+            from gi.repository import GLib
+            def verify_position():
+                alloc = frame.get_allocation()
+                log.info("Element '%s' actual allocation: x=%d, y=%d, width=%d, height=%d",
+                         elem_id, alloc.x, alloc.y, alloc.width, alloc.height)
+                return False
+            GLib.idle_add(verify_position)
+
             log.info(
                 "Added element '%s' (type=%s, source=%s, editable=%s) at (%d, %d)",
                 elem_id,
@@ -515,12 +529,14 @@ class HudWindow(Gtk.Window):
         width = self.container.get_allocated_width()
         height = self.container.get_allocated_height()
         if width > 0 and height > 0:
+            log.debug("Viewport size: %dx%d (source: container)", width, height)
             return width, height
 
         surface = self.get_surface()
         if surface is not None:
             width = max(1, int(surface.get_width()))
             height = max(1, int(surface.get_height()))
+            log.debug("Viewport size: %dx%d (source: surface)", width, height)
             return width, height
 
         display = Gdk.Display.get_default()
@@ -536,8 +552,10 @@ class HudWindow(Gtk.Window):
 
             if monitor is not None:
                 geometry = monitor.get_geometry()
+                log.debug("Viewport size: %dx%d (source: monitor)", int(geometry.width), int(geometry.height))
                 return int(geometry.width), int(geometry.height)
 
+        log.debug("Viewport size: 1920x1080 (source: fallback)")
         return (1920, 1080)
 
     def set_edit_mode(self, enabled: bool) -> dict:
