@@ -136,6 +136,21 @@ class HudAPIHandler(BaseHTTPRequestHandler):
             self._send_json(result, status)
             return
 
+        if self.path == "/profiles/add":
+            name = str(body.get("name", "")).strip()
+            if not name:
+                self._send_json({"error": "name is required"}, 400)
+                return
+
+            result = self._dispatch_to_main_thread(self.hud_window.add_profile, name)
+            if result.get("ok"):
+                self._send_json(result)
+                return
+
+            status = 404 if result.get("error_code") == "profile_not_found" else 400
+            self._send_json(result, status)
+            return
+
         if self.path == "/profiles/save":
             name = str(body.get("name", "")).strip()
             if not name:

@@ -22,38 +22,10 @@ layouts:
   last_used_profile: last-used   # autosave target profile name
   autosave_last_used: true
   editable_trait_items: false
+  startup_profiles: [default]    # profiles loaded at start (additive, in order)
 
-elements:
-  - id: sample-gauge
-    type: graph
-    renderer: gauge
-    renderer_config:
-      min_value: 0
-      max_value: 100
-      label: "CPU"
-    provider:
-      type: command
-      command: "grep 'cpu ' /proc/stat | awk '{u=$2+$4; t=$2+$4+$5} END {printf \"%.0f\", u*100/t}'"
-      interval_ms: 2000
-    position: { x: 50, y: 50 }
-    size: { width: 150, height: 150 }
-    opacity: 0.8
-
-  - id: sample-image
-    type: image
-    source: ~/Pictures/logo.png
-    position: { x: 250, y: 50 }
-    size: { width: 100, height: 100 }
-    opacity: 0.5
-
-  - id: sample-video
-    type: video
-    source: ~/Videos/overlay.webm
-    loop: true
-    alpha: true
-    position: { x: 400, y: 50 }
-    size: { width: 200, height: 200 }
-    opacity: 1.0
+# Elements are defined in layout files under layouts/ directory.
+# See layouts/default.yaml for the element format.
 
 api:
   enabled: true

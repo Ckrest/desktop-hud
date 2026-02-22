@@ -34,6 +34,9 @@ class LayoutProfileManager:
         self.last_used_profile = str(layouts_cfg.get("last_used_profile", "last-used"))
         self.autosave_last_used = bool(layouts_cfg.get("autosave_last_used", True))
         self.editable_trait_items = bool(layouts_cfg.get("editable_trait_items", False))
+        self.startup_profiles: list[str] = layouts_cfg.get(
+            "startup_profiles", [self.default_profile],
+        )
 
         self.directory.mkdir(parents=True, exist_ok=True)
 
@@ -67,7 +70,8 @@ class LayoutProfileManager:
                 names.append(stem)
         return names
 
-    def load_profile(self, name: str) -> dict[str, dict[str, int]]:
+    def load_profile(self, name: str) -> list[dict]:
+        """Load a profile and return full element definitions."""
         path = self._profile_path(name)
         if not path.exists():
             raise FileNotFoundError(path)
@@ -75,33 +79,17 @@ class LayoutProfileManager:
         with open(path) as handle:
             data = yaml.safe_load(handle) or {}
 
-        element_data: dict[str, dict[str, int]] = {}
-        for item in data.get("elements", []):
-            element_id = item.get("id")
-            if not element_id:
-                continue
+        return data.get("elements", [])
 
-            position = item.get("position", {})
-            size = item.get("size", {})
-            if not isinstance(position, dict) or not isinstance(size, dict):
-                continue
-
-            try:
-                x = int(position.get("x", 0))
-                y = int(position.get("y", 0))
-                width = int(size.get("width", 100))
-                height = int(size.get("height", 100))
-            except (TypeError, ValueError):
-                continue
-
-            element_data[element_id] = {
-                "x": x,
-                "y": y,
-                "width": width,
-                "height": height,
-            }
-
-        return element_data
+    def load_profiles(self, names: list[str]) -> list[dict]:
+        """Load multiple profiles additively. Later profiles override by element id."""
+        elements_by_id: dict[str, dict] = {}
+        for name in names:
+            for elem in self.load_profile(name):
+                elem_id = elem.get("id")
+                if elem_id:
+                    elements_by_id[elem_id] = elem
+        return list(elements_by_id.values())
 
     def save_profile(self, name: str, elements: list[dict]) -> Path:
         path = self._profile_path(name)
@@ -110,17 +98,12 @@ class LayoutProfileManager:
         for item in elements:
             if not item.get("editable", True):
                 continue
-            serializable.append({
-                "id": item["id"],
-                "position": {
-                    "x": int(item["position"]["x"]),
-                    "y": int(item["position"]["y"]),
-                },
-                "size": {
-                    "width": int(item["size"]["width"]),
-                    "height": int(item["size"]["height"]),
-                },
-            })
+            entry = dict(item)
+            # Remove runtime-only keys
+            entry.pop("source", None)
+            entry.pop("editable", None)
+            entry.pop("__source", None)
+            serializable.append(entry)
 
         payload = {
             "name": self._validate_profile_name(name),

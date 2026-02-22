@@ -1,11 +1,23 @@
 name: last-used
 meta:
-  updated_at: '2026-02-22T17:08:32.331716+00:00'
+  updated_at: '2026-02-22T19:14:47.485257+00:00'
 elements:
 - id: cpu-gauge
+  type: graph
+  renderer: gauge
+  renderer_config:
+    min_value: 0
+    max_value: 100
+    label: CPU
+  provider:
+    type: command
+    command: grep 'cpu ' /proc/stat | awk '{u=$2+$4; t=$2+$4+$5} END {printf "%.0f",
+      u*100/t}'
+    interval_ms: 2000
   position:
     x: 50
     y: 50
   size:
     width: 150
     height: 150
+  opacity: 0.8

@@ -64,12 +64,12 @@ class HudWindow(Gtk.Window):
 
         self.profile_manager = LayoutProfileManager(PACKAGE_DIR, self.config)
         self.active_profile = self.profile_manager.default_profile
+        self.active_profiles: list[str] = []
 
         self._setup_layer_shell()
         self._setup_container()
         self._setup_editor()
-        self._load_elements(self.config.get("elements", []))
-        self._initialize_profiles()
+        self._load_startup_profiles()
 
         if self.editor.is_edit_mode():
             self._on_editor_mode_changed(True)
@@ -176,18 +176,66 @@ class HudWindow(Gtk.Window):
             on_mode_changed=self._on_editor_mode_changed,
         )
 
-    def _load_elements(self, element_configs: list[dict]):
-        for elem_cfg in element_configs:
-            self._add_element(elem_cfg)
+    def _load_startup_profiles(self):
+        """Load elements from startup profiles, trait discovery, and last-used geometry."""
+        profiles = self.profile_manager.startup_profiles
 
-    def _initialize_profiles(self):
-        snapshot = self.get_elements_info()
-        try:
-            self.profile_manager.ensure_profile_exists(self.profile_manager.default_profile, snapshot)
-            self.switch_profile(self.profile_manager.default_profile)
-            self._maybe_autosave_last_used()
-        except Exception:
-            log.exception("Failed to initialize layout profiles")
+        # Backward compat: if config still has elements but no startup_profiles in config,
+        # fall back to loading from config elements (log deprecation warning).
+        config_elements = self.config.get("elements", [])
+        has_explicit_startup = "startup_profiles" in self.config.get("layouts", {})
+
+        if config_elements and not has_explicit_startup:
+            log.warning(
+                "Deprecated: loading elements from config 'elements' key. "
+                "Move element definitions to layout files and use 'startup_profiles' instead.",
+            )
+            for elem_cfg in config_elements:
+                self._add_element(elem_cfg)
+        else:
+            try:
+                elements = self.profile_manager.load_profiles(profiles)
+                for elem_cfg in elements:
+                    self._add_element(elem_cfg)
+                self.active_profiles = list(profiles)
+                self.active_profile = profiles[-1] if profiles else self.profile_manager.default_profile
+            except Exception:
+                log.exception("Failed to load startup profiles %s", profiles)
+
+        # Add trait-discovered elements
+        for elem_cfg in self.config.get("_trait_elements", []):
+            copy = dict(elem_cfg)
+            copy["__source"] = "trait"
+            self._add_element(copy)
+
+        # Restore last-used geometry on top if available
+        if self.profile_manager.autosave_last_used:
+            try:
+                last_used = self.profile_manager.load_profile(
+                    self.profile_manager.last_used_profile,
+                )
+                last_used_by_id = {e.get("id"): e for e in last_used if e.get("id")}
+                with self._suspend_autosave():
+                    for elem_id, elem_cfg in last_used_by_id.items():
+                        if elem_id in self.elements:
+                            pos = elem_cfg.get("position", {})
+                            size = elem_cfg.get("size", {})
+                            self.update_element(elem_id, {
+                                "position": {
+                                    "x": pos.get("x", 0),
+                                    "y": pos.get("y", 0),
+                                },
+                                "size": {
+                                    "width": size.get("width", 100),
+                                    "height": size.get("height", 100),
+                                },
+                            }, autosave=False)
+            except FileNotFoundError:
+                pass
+            except Exception:
+                log.exception("Failed to restore last-used layout")
+
+        self._maybe_autosave_last_used()
 
     @contextmanager
     def _suspend_autosave(self):
@@ -521,13 +569,15 @@ class HudWindow(Gtk.Window):
         return {
             "profiles": names,
             "active": self.active_profile,
+            "active_profiles": self.active_profiles,
             "default": self.profile_manager.default_profile,
             "last_used": self.profile_manager.last_used_profile,
         }
 
     def switch_profile(self, name: str) -> dict:
+        """Switch to a profile — replaces all non-trait elements."""
         try:
-            geometry_map = self.profile_manager.load_profile(name)
+            elements = self.profile_manager.load_profile(name)
         except FileNotFoundError:
             return {
                 "ok": False,
@@ -549,28 +599,61 @@ class HudWindow(Gtk.Window):
             }
 
         with self._suspend_autosave():
-            for elem_id, geometry in geometry_map.items():
-                if not self.is_element_editable(elem_id):
-                    continue
-                if elem_id not in self.elements:
-                    continue
-                self.update_element(
-                    elem_id,
-                    {
-                        "position": {"x": geometry["x"], "y": geometry["y"]},
-                        "size": {
-                            "width": geometry["width"],
-                            "height": geometry["height"],
-                        },
-                    },
-                    autosave=False,
-                )
+            # Remove all current non-trait elements
+            for elem_id in list(self.elements.keys()):
+                record = self.elements[elem_id]
+                if record.source != "trait":
+                    self.remove_element(elem_id, autosave=False)
 
+            # Add elements from profile
+            for elem_cfg in elements:
+                self._add_element(elem_cfg)
+
+        self.active_profiles = [name]
         self.active_profile = name
         self._maybe_autosave_last_used()
         return {
             "ok": True,
             "active": self.active_profile,
+        }
+
+    def add_profile(self, name: str) -> dict:
+        """Additively load a profile on top of current elements."""
+        try:
+            elements = self.profile_manager.load_profile(name)
+        except FileNotFoundError:
+            return {
+                "ok": False,
+                "error_code": "profile_not_found",
+                "message": f"Profile '{name}' does not exist",
+            }
+        except LayoutProfileError as exc:
+            return {
+                "ok": False,
+                "error_code": "invalid_profile_name",
+                "message": str(exc),
+            }
+
+        with self._suspend_autosave():
+            for elem_cfg in elements:
+                elem_id = elem_cfg.get("id")
+                if elem_id and elem_id in self.elements:
+                    pos = elem_cfg.get("position", {})
+                    size = elem_cfg.get("size", {})
+                    self.update_element(elem_id, {
+                        "position": pos, "size": size,
+                    }, autosave=False)
+                else:
+                    self._add_element(elem_cfg)
+
+        if name not in self.active_profiles:
+            self.active_profiles.append(name)
+        self.active_profile = name
+        self._maybe_autosave_last_used()
+        return {
+            "ok": True,
+            "active": name,
+            "active_profiles": self.active_profiles,
         }
 
     def save_profile(self, name: str) -> dict:
@@ -620,19 +703,11 @@ class HudWindow(Gtk.Window):
         }
 
     def reload_config(self, new_config: dict):
-        """Diff elements and apply changes while preserving active profile where possible."""
+        """Reload config and re-load active profiles."""
         self.config = new_config
         self.base_click_through = bool(self.config.get("overlay", {}).get("click_through", True))
         self._load_interaction_config()
-
         self.profile_manager = LayoutProfileManager(PACKAGE_DIR, self.config)
-        try:
-            self.profile_manager.ensure_profile_exists(
-                self.profile_manager.default_profile,
-                self.get_elements_info(),
-            )
-        except Exception:
-            log.exception("Failed to ensure default profile during reload")
 
         overlay_cfg = self.config.get("overlay", {})
         interaction_cfg = overlay_cfg.get("interaction", {})
@@ -653,61 +728,32 @@ class HudWindow(Gtk.Window):
         self.editor.hotkey_spec = str(overlay_cfg.get("edit_hotkey", "Ctrl+Alt+M"))
         self.editor.hotkey = self.editor._parse_hotkey(self.editor.hotkey_spec)
 
-        new_elements = {
-            e["id"]: e
-            for e in new_config.get("elements", [])
-            if isinstance(e, dict) and "id" in e
-        }
-        old_ids = set(self.elements.keys())
-        new_ids = set(new_elements.keys())
-
+        # Re-load active profiles (preserves trait elements)
         with self._suspend_autosave():
-            # Remove elements no longer in config.
-            for elem_id in old_ids - new_ids:
-                self.remove_element(elem_id, autosave=False)
-
-            # Add new elements.
-            for elem_id in new_ids - old_ids:
-                self._add_element(new_elements[elem_id])
-
-            # Update existing element properties from config.
-            for elem_id in old_ids & new_ids:
-                cfg = new_elements[elem_id]
-                source = cfg.get("__source", "config")
-                record = self.elements.get(elem_id)
-                if record is None:
-                    continue
-                editable = source != "trait" or self.profile_manager.editable_trait_items
-
-                # If type/source changed, recreate the element.
-                if (
-                    cfg.get("type") != record.element.elem_type
-                    or source != record.source
-                    or editable != record.editable
-                ):
+            for elem_id in list(self.elements.keys()):
+                record = self.elements[elem_id]
+                if record.source != "trait":
                     self.remove_element(elem_id, autosave=False)
-                    self._add_element(cfg)
+
+            try:
+                profiles = self.active_profiles or self.profile_manager.startup_profiles
+                elements = self.profile_manager.load_profiles(profiles)
+                for elem_cfg in elements:
+                    self._add_element(elem_cfg)
+            except Exception:
+                log.exception("Failed to reload profiles")
+
+            # Re-add trait elements
+            for elem_cfg in self.config.get("_trait_elements", []):
+                elem_id = elem_cfg.get("id")
+                if elem_id and elem_id in self.elements:
                     continue
-
-                updates = {}
-                if "position" in cfg:
-                    updates["position"] = cfg["position"]
-                if "size" in cfg:
-                    updates["size"] = cfg["size"]
-                if "opacity" in cfg:
-                    updates["opacity"] = cfg["opacity"]
-
-                if updates:
-                    self.update_element(elem_id, updates, autosave=False)
-
-            # Re-apply active profile geometry on top of config positions.
-            switch_result = self.switch_profile(self.active_profile)
-            if not switch_result.get("ok"):
-                self.switch_profile(self.profile_manager.default_profile)
+                copy = dict(elem_cfg)
+                copy["__source"] = "trait"
+                self._add_element(copy)
 
         self.editor.set_edit_mode(bool(self.config.get("overlay", {}).get("edit_mode", False)))
         self.editor.refresh_all()
-
         self._refresh_input_region()
         self._maybe_autosave_last_used()
 
@@ -717,21 +763,15 @@ class HudWindow(Gtk.Window):
         result = []
         for elem_id, record in self.elements.items():
             element = record.element
-            result.append({
-                "id": elem_id,
-                "type": element.elem_type,
-                "position": {
-                    "x": int(element.position[0]),
-                    "y": int(element.position[1]),
-                },
-                "size": {
-                    "width": int(element.size[0]),
-                    "height": int(element.size[1]),
-                },
-                "opacity": float(element.opacity),
-                "source": record.source,
-                "editable": record.editable,
-            })
+            # Start from original config for full round-trip
+            entry = dict(element.config)
+            # Overlay current runtime geometry
+            entry["position"] = {"x": int(element.position[0]), "y": int(element.position[1])}
+            entry["size"] = {"width": int(element.size[0]), "height": int(element.size[1])}
+            entry["opacity"] = float(element.opacity)
+            entry["source"] = record.source
+            entry["editable"] = record.editable
+            result.append(entry)
         return result
 
 
@@ -742,39 +782,35 @@ class HudApplication(Gtk.Application):
         super().__init__(application_id="com.systems.desktop-hud")
         self.window: HudWindow | None = None
         self.api_thread: threading.Thread | None = None
+        self.cli_profiles: list[str] | None = None
+        self.cli_add_profiles: list[str] | None = None
+        self.cli_no_last_used: bool = False
 
     def _with_trait_elements(self, config: dict) -> dict:
         merged = dict(config)
-        merged_elements: list[dict] = []
-
-        for elem in config.get("elements", []):
-            if not isinstance(elem, dict):
-                continue
-            copy = dict(elem)
-            copy.setdefault("__source", "config")
-            merged_elements.append(copy)
-
         try:
             from desktop_hud.discovery import discover_trait_elements
 
             trait_elements = discover_trait_elements()
-            for elem in trait_elements:
-                if not isinstance(elem, dict):
-                    continue
-                copy = dict(elem)
-                copy["__source"] = "trait"
-                merged_elements.append(copy)
-
+            merged["_trait_elements"] = trait_elements
             if trait_elements:
                 log.info("Loaded %d trait-discovered elements", len(trait_elements))
         except Exception:
             log.exception("Trait discovery failed (non-fatal)")
-
-        merged["elements"] = merged_elements
+            merged["_trait_elements"] = []
         return merged
 
     def do_activate(self):
         config = self._with_trait_elements(load_config())
+
+        if self.cli_profiles:
+            config.setdefault("layouts", {})["startup_profiles"] = self.cli_profiles
+        if self.cli_add_profiles:
+            existing = config.get("layouts", {}).get("startup_profiles", ["default"])
+            config.setdefault("layouts", {})["startup_profiles"] = existing + self.cli_add_profiles
+        if self.cli_no_last_used:
+            config.setdefault("layouts", {})["autosave_last_used"] = False
+
         self.window = HudWindow(self, config)
         self.window.present()
 
@@ -805,7 +841,16 @@ class HudApplication(Gtk.Application):
             log.exception("Config reload failed")
 
 
-def main():
+def main(argv: list[str] | None = None):
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Desktop HUD overlay")
+    parser.add_argument("--profile", nargs="*", help="Startup profile(s) to load (overrides config)")
+    parser.add_argument("--add", nargs="*", help="Additional profile(s) to load on top")
+    parser.add_argument("--no-last-used", action="store_true", help="Skip restoring last-used geometry")
+
+    args = parser.parse_args(argv)
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
@@ -813,6 +858,9 @@ def main():
     )
 
     app = HudApplication()
+    app.cli_profiles = args.profile
+    app.cli_add_profiles = args.add
+    app.cli_no_last_used = args.no_last_used
 
     # SIGHUP triggers config reload.
     def on_sighup(*_args):

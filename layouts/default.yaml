@@ -1,4 +1,23 @@
 name: default
 meta:
   updated_at: '2026-02-22T09:36:35.085515+00:00'
-elements: []
+elements:
+- id: cpu-gauge
+  type: graph
+  renderer: gauge
+  renderer_config:
+    min_value: 0
+    max_value: 100
+    label: CPU
+  provider:
+    type: command
+    command: "grep 'cpu ' /proc/stat | awk '{u=$2+$4; t=$2+$4+$5} END {printf \"\
+      %.0f\", u*100/t}'"
+    interval_ms: 2000
+  position:
+    x: 50
+    y: 50
+  size:
+    width: 150
+    height: 150
+  opacity: 0.8
