@@ -11,10 +11,8 @@ Configurable desktop overlay (HUD) for Wayland desktops. Renders images, videos 
 - **Interactive edit mode** — outline elements, drag to move, corner-drag to resize
 - **Smart snapping** — snap to screen edges/corners and sibling element edges
 - **Layout profiles** — switch/save named layouts and autosave `last-used` recovery
-- **Safe trait behavior** — trait-discovered elements are read-only by default
 - **HTTP API** — add, remove, and update elements at runtime
 - **Config hot-reload** — send SIGHUP to apply config changes without restart
-- **Trait discovery** — other packages can contribute HUD elements via the `desktop-hud` trait
 
 ## Requirements
 
@@ -53,8 +51,6 @@ layouts:
   default_profile: default
   last_used_profile: last-used
   autosave_last_used: true
-  editable_trait_items: false
-
 elements:
   - id: cpu-gauge
     type: graph
@@ -118,6 +114,9 @@ gst-inspect-1.0 gtk4paintablesink
 The HTTP API runs on `http://127.0.0.1:7820` by default:
 
 ```bash
+# Health check
+curl http://localhost:7820/health
+
 # List elements
 curl http://localhost:7820/elements
 
@@ -144,6 +143,17 @@ curl -X POST http://localhost:7820/mode \
 
 # Inspect live interaction diagnostics
 curl http://localhost:7820/mode/diagnostics
+
+# Get current layout snapshot
+curl http://localhost:7820/profiles/current
+
+# Additively load a profile
+curl -X POST http://localhost:7820/profiles/add \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"extra-gauges"}'
+
+# Save current state to last-used profile
+curl -X POST http://localhost:7820/profiles/save-last-used
 
 # List/switch/save profiles
 curl http://localhost:7820/profiles

@@ -17,7 +17,7 @@ PROVIDERS = {}
 
 
 def _ensure_graph_lib():
-    """Import graph-lib via systems dependency resolution."""
+    """Lazy-import graph-lib renderers and providers."""
     global RENDERERS, PROVIDERS
     if RENDERERS:
         return True
