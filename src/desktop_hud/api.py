@@ -105,8 +105,7 @@ class HudAPIHandler(BaseHTTPRequestHandler):
         if self.path == "/reload":
             from desktop_hud.config import load_config
 
-            # Keep trait elements in reload parity with app startup.
-            config = self.hud_window.get_application()._with_trait_elements(load_config())
+            config = load_config()
             self._dispatch_to_main_thread(self.hud_window.reload_config, config)
             self._send_json({"status": "reloaded"})
             return

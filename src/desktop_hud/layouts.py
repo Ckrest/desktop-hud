@@ -33,7 +33,6 @@ class LayoutProfileManager:
         self.default_profile = str(layouts_cfg.get("default_profile", "default"))
         self.last_used_profile = str(layouts_cfg.get("last_used_profile", "last-used"))
         self.autosave_last_used = bool(layouts_cfg.get("autosave_last_used", True))
-        self.editable_trait_items = bool(layouts_cfg.get("editable_trait_items", False))
         self.startup_profiles: list[str] = layouts_cfg.get(
             "startup_profiles", [self.default_profile],
         )

@@ -23,15 +23,6 @@ def _ensure_graph_lib():
         return True
 
     try:
-        from systems import ensure_importable
-
-        if not ensure_importable("graph-lib"):
-            log.error("graph-lib not importable via systems")
-            return False
-    except ImportError:
-        log.warning("systems package not available, trying direct import")
-
-    try:
         from graph_lib import LineChartRenderer, GaugeRenderer, GraphWidget
         from graph_lib.providers import CommandProvider
         from graph_lib import StaticProvider, DataPoint

@@ -28,10 +28,12 @@ node_modules/
 *.safetensors
 *.pid
 
-# Systems registry files (tracked by vcsh systems)
+# Registry files (externally managed)
 manifest.yaml
 NOTES.md
 trait_*.yaml
 
 # Package-specific
 config.local.yaml
+layouts/
+pkg/systemd/

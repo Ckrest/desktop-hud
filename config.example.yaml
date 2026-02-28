@@ -1,3 +1,6 @@
+# data_dir: platform default (~/.local/share/desktop-hud on Linux)
+# cache_dir: platform default (~/.cache/desktop-hud on Linux)
+
 overlay:
   layer: overlay                 # overlay | top
   namespace: desktop-hud         # layer-shell namespace
@@ -17,11 +20,10 @@ overlay:
     snap_hysteresis_px: 4
 
 layouts:
-  directory: layouts             # relative to package dir unless absolute
+  # directory: layouts            # relative to package dir, or absolute path
   default_profile: default       # loaded at startup
   last_used_profile: last-used   # autosave target profile name
   autosave_last_used: true
-  editable_trait_items: false
   startup_profiles: [default]    # profiles loaded at start (additive, in order)
 
 # Elements are defined in layout files under layouts/ directory.

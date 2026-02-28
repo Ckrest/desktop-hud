@@ -9,7 +9,12 @@ authors = [{name = "Ckrest"}]
 dependencies = [
     "PyYAML",
     "PyGObject",
+    "pycairo",
+    "graph-lib",
 ]
+
+[project.urls]
+Repository = "https://github.com/Ckrest/desktop-hud"
 
 [build-system]
 requires = ["setuptools>=64"]

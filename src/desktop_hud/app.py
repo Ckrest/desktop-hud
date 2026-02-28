@@ -177,7 +177,7 @@ class HudWindow(Gtk.Window):
         )
 
     def _load_startup_profiles(self):
-        """Load elements from startup profiles, trait discovery, and last-used geometry."""
+        """Load elements from startup profiles and last-used geometry."""
         profiles = self.profile_manager.startup_profiles
 
         # Backward compat: if config still has elements but no startup_profiles in config,
@@ -201,12 +201,6 @@ class HudWindow(Gtk.Window):
                 self.active_profile = profiles[-1] if profiles else self.profile_manager.default_profile
             except Exception:
                 log.exception("Failed to load startup profiles %s", profiles)
-
-        # Add trait-discovered elements
-        for elem_cfg in self.config.get("_trait_elements", []):
-            copy = dict(elem_cfg)
-            copy["__source"] = "trait"
-            self._add_element(copy)
 
         # Restore last-used geometry on top if available
         if self.profile_manager.autosave_last_used:
@@ -291,7 +285,7 @@ class HudWindow(Gtk.Window):
             content_widget.set_size_request(width, height)
             content_widget.set_opacity(opacity)
 
-            editable = source != "trait" or self.profile_manager.editable_trait_items
+            editable = True
             frame = self.editor.register_element(elem_id, content_widget, editable=editable)
             frame.set_size_request(width, height)
 
@@ -593,7 +587,7 @@ class HudWindow(Gtk.Window):
         }
 
     def switch_profile(self, name: str) -> dict:
-        """Switch to a profile — replaces all non-trait elements."""
+        """Switch to a profile — replaces all current elements."""
         try:
             elements = self.profile_manager.load_profile(name)
         except FileNotFoundError:
@@ -617,11 +611,8 @@ class HudWindow(Gtk.Window):
             }
 
         with self._suspend_autosave():
-            # Remove all current non-trait elements
             for elem_id in list(self.elements.keys()):
-                record = self.elements[elem_id]
-                if record.source != "trait":
-                    self.remove_element(elem_id, autosave=False)
+                self.remove_element(elem_id, autosave=False)
 
             # Add elements from profile
             for elem_cfg in elements:
@@ -746,12 +737,10 @@ class HudWindow(Gtk.Window):
         self.editor.hotkey_spec = str(overlay_cfg.get("edit_hotkey", "Ctrl+Alt+M"))
         self.editor.hotkey = self.editor._parse_hotkey(self.editor.hotkey_spec)
 
-        # Re-load active profiles (preserves trait elements)
+        # Re-load active profiles
         with self._suspend_autosave():
             for elem_id in list(self.elements.keys()):
-                record = self.elements[elem_id]
-                if record.source != "trait":
-                    self.remove_element(elem_id, autosave=False)
+                self.remove_element(elem_id, autosave=False)
 
             try:
                 profiles = self.active_profiles or self.profile_manager.startup_profiles
@@ -760,15 +749,6 @@ class HudWindow(Gtk.Window):
                     self._add_element(elem_cfg)
             except Exception:
                 log.exception("Failed to reload profiles")
-
-            # Re-add trait elements
-            for elem_cfg in self.config.get("_trait_elements", []):
-                elem_id = elem_cfg.get("id")
-                if elem_id and elem_id in self.elements:
-                    continue
-                copy = dict(elem_cfg)
-                copy["__source"] = "trait"
-                self._add_element(copy)
 
         self.editor.set_edit_mode(bool(self.config.get("overlay", {}).get("edit_mode", False)))
         self.editor.refresh_all()
@@ -797,29 +777,15 @@ class HudApplication(Gtk.Application):
     """Main application managing the overlay window and API server."""
 
     def __init__(self):
-        super().__init__(application_id="com.systems.desktop-hud")
+        super().__init__(application_id="com.ckrest.desktop-hud")
         self.window: HudWindow | None = None
         self.api_thread: threading.Thread | None = None
         self.cli_profiles: list[str] | None = None
         self.cli_add_profiles: list[str] | None = None
         self.cli_no_last_used: bool = False
 
-    def _with_trait_elements(self, config: dict) -> dict:
-        merged = dict(config)
-        try:
-            from desktop_hud.discovery import discover_trait_elements
-
-            trait_elements = discover_trait_elements()
-            merged["_trait_elements"] = trait_elements
-            if trait_elements:
-                log.info("Loaded %d trait-discovered elements", len(trait_elements))
-        except Exception:
-            log.exception("Trait discovery failed (non-fatal)")
-            merged["_trait_elements"] = []
-        return merged
-
     def do_activate(self):
-        config = self._with_trait_elements(load_config())
+        config = load_config()
 
         if self.cli_profiles:
             config.setdefault("layouts", {})["startup_profiles"] = self.cli_profiles
@@ -853,7 +819,7 @@ class HudApplication(Gtk.Application):
             return
 
         try:
-            config = self._with_trait_elements(load_config())
+            config = load_config()
             self.window.reload_config(config)
         except Exception:
             log.exception("Config reload failed")
