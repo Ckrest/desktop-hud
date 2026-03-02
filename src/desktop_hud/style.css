@@ -43,3 +43,21 @@ window {
     font-size: 11px;
     font-weight: 600;
 }
+
+.hud-placeholder {
+    border: 1px dashed rgba(212, 190, 158, 0.55);
+    border-radius: 8px;
+    background: rgba(36, 28, 20, 0.35);
+    padding: 10px;
+}
+
+.hud-placeholder-title {
+    color: rgba(237, 220, 196, 0.92);
+    font-weight: 700;
+    font-size: 13px;
+}
+
+.hud-placeholder-detail {
+    color: rgba(216, 198, 173, 0.78);
+    font-size: 11px;
+}

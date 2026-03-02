@@ -31,7 +31,7 @@ from gi.repository import Gtk4LayerShell as LayerShell
 
 from desktop_hud.config import PACKAGE_DIR, load_config
 from desktop_hud.editor import EditController
-from desktop_hud.elements import ELEMENT_TYPES
+from desktop_hud.elements import ELEMENT_TYPES, ElementSkipRequested
 from desktop_hud.layouts import LayoutProfileError, LayoutProfileManager
 from desktop_hud.snap import Rect
 
@@ -247,6 +247,89 @@ class HudWindow(Gtk.Window):
         except Exception:
             log.exception("Autosave of last-used layout failed")
 
+    @staticmethod
+    def _merge_element_config(base: dict, updates: dict) -> dict:
+        """Recursively merge PATCH updates into an element config."""
+        merged = dict(base)
+        for key, value in updates.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = HudWindow._merge_element_config(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+
+    def _recreate_element_widget(self, elem_id: str, merged_config: dict) -> bool:
+        """Rebuild an element widget in-place for backend-sensitive config updates."""
+        record = self.elements.get(elem_id)
+        if record is None:
+            return False
+
+        old_element = record.element
+        elem_type = str(merged_config.get("type", getattr(old_element, "elem_type", "")))
+        cls = ELEMENT_TYPES.get(elem_type)
+        if cls is None:
+            log.warning("Cannot recreate element '%s': unknown type '%s'", elem_id, elem_type)
+            return False
+
+        try:
+            new_element = cls(merged_config)
+            new_widget = new_element.create_widget()
+        except ElementSkipRequested as exc:
+            log.warning("Recreate skipped for element '%s': %s", elem_id, exc)
+            return False
+        except Exception:
+            log.exception("Failed to recreate element '%s'", elem_id)
+            return False
+
+        if new_widget is None:
+            log.warning("Recreate produced no widget for element '%s'", elem_id)
+            return False
+
+        pos = merged_config.get("position", {})
+        x = int(pos.get("x", old_element.position[0]))
+        y = int(pos.get("y", old_element.position[1]))
+
+        size = merged_config.get("size", {})
+        width = int(size.get("width", old_element.size[0]))
+        height = int(size.get("height", old_element.size[1]))
+        x, y, width, height = self._normalize_geometry(x, y, width, height)
+
+        opacity = float(merged_config.get("opacity", old_element.opacity))
+        new_widget.set_size_request(width, height)
+        new_widget.set_opacity(opacity)
+        record.frame.set_size_request(width, height)
+        self.container.move(record.frame, x, y)
+        record.frame.set_child(new_widget)
+
+        managed = self.editor.frames.get(elem_id)
+        if managed is not None:
+            managed.content_widget = new_widget
+            try:
+                managed.content_target_default = bool(new_widget.get_can_target())
+            except Exception:
+                managed.content_target_default = True
+            self.editor.refresh_all()
+
+        merged_config["position"] = {"x": x, "y": y}
+        merged_config["size"] = {"width": width, "height": height}
+        merged_config["opacity"] = opacity
+        new_element.position = (x, y)
+        new_element.size = (width, height)
+        new_element.opacity = opacity
+        new_element.config = merged_config
+        record.element = new_element
+
+        try:
+            old_element.destroy()
+        except Exception:
+            log.exception("Error destroying old widget for element '%s'", elem_id)
+
+        self.container.queue_draw()
+        record.frame.queue_draw()
+        new_widget.queue_draw()
+        log.info("Recreated element '%s' (type=%s) after runtime config update", elem_id, elem_type)
+        return True
+
     def _add_element(self, elem_cfg: dict) -> bool:
         cfg = dict(elem_cfg)
 
@@ -270,6 +353,9 @@ class HudWindow(Gtk.Window):
         try:
             element = cls(cfg)
             content_widget = element.create_widget()
+            if content_widget is None:
+                log.info("Element '%s' was skipped by source policy", elem_id)
+                return False
 
             pos = cfg.get("position", {})
             x = int(pos.get("x", 0))
@@ -325,6 +411,9 @@ class HudWindow(Gtk.Window):
                 y,
             )
             return True
+        except ElementSkipRequested as exc:
+            log.info("Skipped element '%s': %s", elem_id, exc)
+            return False
         except Exception:
             log.exception("Failed to create element '%s'", elem_id)
             return False
@@ -375,10 +464,33 @@ class HudWindow(Gtk.Window):
         if content_widget is None:
             return False
 
+        if "id" in updates and str(updates["id"]) != elem_id:
+            log.warning("Rejected id change for element '%s': %s", elem_id, updates["id"])
+            return False
+
+        if "type" in updates and str(updates["type"]) != str(element.elem_type):
+            log.warning("Rejected type change for element '%s': %s", elem_id, updates["type"])
+            return False
+
+        merged_config = self._merge_element_config(element.config, updates)
+        if element.runtime_update_requires_recreate(updates):
+            if not self._recreate_element_widget(elem_id, merged_config):
+                return False
+            record = self.elements.get(elem_id)
+            if record is None:
+                return False
+            element = record.element
+            content_widget = element.widget
+            if content_widget is None:
+                return False
+        else:
+            element.config = merged_config
+
         if "opacity" in updates:
             opacity = float(updates["opacity"])
             content_widget.set_opacity(opacity)
             element.opacity = opacity
+            element.config["opacity"] = opacity
 
         if "position" in updates or "size" in updates:
             x, y = element.position
@@ -401,6 +513,8 @@ class HudWindow(Gtk.Window):
 
             element.position = (x, y)
             element.size = (width, height)
+            element.config["position"] = {"x": x, "y": y}
+            element.config["size"] = {"width": width, "height": height}
             updated_rect = Rect(x=x, y=y, width=width, height=height)
             self._queue_geometry_redraw(
                 record=record,
@@ -767,7 +881,7 @@ class HudWindow(Gtk.Window):
             entry["position"] = {"x": int(element.position[0]), "y": int(element.position[1])}
             entry["size"] = {"width": int(element.size[0]), "height": int(element.size[1])}
             entry["opacity"] = float(element.opacity)
-            entry["source"] = record.source
+            entry["__source"] = record.source
             entry["editable"] = record.editable
             result.append(entry)
         return result
@@ -803,13 +917,32 @@ class HudApplication(Gtk.Application):
             from desktop_hud.api import start_api_server
 
             port = api_cfg.get("port", 7820)
+            raw_timeout = api_cfg.get("main_thread_timeout_seconds", 5.0)
+            try:
+                timeout_seconds = float(raw_timeout)
+            except (TypeError, ValueError):
+                log.warning(
+                    "Invalid api.main_thread_timeout_seconds=%r; falling back to 5.0",
+                    raw_timeout,
+                )
+                timeout_seconds = 5.0
+            if timeout_seconds <= 0:
+                log.warning(
+                    "Invalid api.main_thread_timeout_seconds=%s; falling back to 5.0",
+                    timeout_seconds,
+                )
+                timeout_seconds = 5.0
             self.api_thread = threading.Thread(
                 target=start_api_server,
-                args=(self.window, port),
+                args=(self.window, port, timeout_seconds),
                 daemon=True,
             )
             self.api_thread.start()
-            log.info("API server started on port %d", port)
+            log.info(
+                "API server started on port %d with dispatch timeout %.2fs",
+                port,
+                timeout_seconds,
+            )
 
         log.info("Desktop HUD started with %d elements", len(self.window.elements))
 

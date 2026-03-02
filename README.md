@@ -5,7 +5,7 @@ Configurable desktop overlay (HUD) for Wayland desktops. Renders images, videos 
 ## Features
 
 - **Image elements** — display PNG, SVG, or any GdkPixbuf-supported format
-- **Video elements** — looping video, with `alpha: true` using native `gtk4paintablesink`
+- **Video elements** — looping video with explicit backend selection (`auto`, `simple`, `alpha-pipeline`)
 - **Graph elements** — live-updating gauges and line charts via graph-lib
 - **Click-through** — overlay does not intercept mouse input
 - **Interactive edit mode** — outline elements, drag to move, corner-drag to resize
@@ -70,7 +70,22 @@ elements:
 api:
   enabled: true
   port: 7820
+  main_thread_timeout_seconds: 5.0
 ```
+
+Element source path behavior:
+- `source` paths can be absolute, `~/...`, or relative to the package root (for example `assets/showcase/botanical-illustration.svg`).
+- Image/video elements support `on_missing_source`:
+  - `error` (default): fail element creation.
+  - `skip`: skip the element without crashing the app.
+  - `placeholder`: render a styled placeholder tile using `placeholder_label`.
+- Video elements support `backend`:
+  - `auto` (default): `alpha-pipeline` when `alpha: true`, else `simple`
+  - `simple`: force `Gtk.Video`/`Gtk.MediaFile`
+  - `alpha-pipeline`: force explicit GStreamer RGBA pipeline
+
+Graph element behavior:
+- `clear_before_draw` is optional and defaults to `false` to avoid transparent flash artifacts between updates.
 
 ## Usage
 
@@ -123,7 +138,7 @@ curl http://localhost:7820/elements
 # Add an element
 curl -X POST http://localhost:7820/elements \
   -H 'Content-Type: application/json' \
-  -d '{"id":"test","type":"image","source":"~/Pictures/logo.png","position":{"x":100,"y":100},"size":{"width":80,"height":80}}'
+  -d '{"id":"test","type":"image","source":"assets/showcase/corner-sigil.svg","on_missing_source":"placeholder","placeholder_label":"Test Image","position":{"x":100,"y":100},"size":{"width":80,"height":80}}'
 
 # Update element
 curl -X PATCH http://localhost:7820/elements/test \
@@ -151,6 +166,9 @@ curl http://localhost:7820/profiles/current
 curl -X POST http://localhost:7820/profiles/add \
   -H 'Content-Type: application/json' \
   -d '{"name":"extra-gauges"}'
+
+# API dispatch timeout (main thread busy) returns HTTP 504 with JSON.
+# Timeout is configurable with api.main_thread_timeout_seconds.
 
 # Save current state to last-used profile
 curl -X POST http://localhost:7820/profiles/save-last-used

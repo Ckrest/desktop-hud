@@ -28,7 +28,11 @@ layouts:
 
 # Elements are defined in layout files under layouts/ directory.
 # See layouts/default.yaml for the element format.
+# For media elements you can configure:
+#   on_missing_source: error | skip | placeholder
+#   placeholder_label: "Human-readable placeholder title"
 
 api:
   enabled: true
   port: 7820
+  main_thread_timeout_seconds: 5.0

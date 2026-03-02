@@ -87,11 +87,12 @@ class GraphElement(HudElement):
         provider = provider_factory(provider_cfg)
 
         refresh_ms = provider_cfg.get("interval_ms", 1000)
+        clear_before_draw = bool(self.config.get("clear_before_draw", False))
         graph_widget = GraphWidget(
             renderer,
             provider,
             refresh_interval_ms=refresh_ms,
-            clear_before_draw=True,
+            clear_before_draw=clear_before_draw,
         )
         graph_widget.set_size_request(*self.size)
         graph_widget.start()

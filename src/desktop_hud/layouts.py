@@ -99,9 +99,9 @@ class LayoutProfileManager:
                 continue
             entry = dict(item)
             # Remove runtime-only keys
-            entry.pop("source", None)
             entry.pop("editable", None)
             entry.pop("__source", None)
+            entry.pop("layout_source", None)
             serializable.append(entry)
 
         payload = {
