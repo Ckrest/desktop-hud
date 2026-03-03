@@ -38,6 +38,5 @@ config.local.yaml
 layouts/
 pkg/systemd/
 
-# Large media assets (exceed GitHub 100MB limit — keep local only)
-assets/*.mov
-assets/*.mp4
+# Assets directory (local only — not distributed)
+assets/
