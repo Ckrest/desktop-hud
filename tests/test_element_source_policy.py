@@ -14,8 +14,7 @@ class ElementSourcePolicyTests(unittest.TestCase):
         cfg = {
             "id": "dummy",
             "type": "image",
-            "position": {"x": 0, "y": 0},
-            "size": {"width": 10, "height": 10},
+            "resolved_frame": {"x": 0, "y": 0, "width": 10, "height": 10},
             "opacity": 1.0,
         }
         cfg.update(overrides)
@@ -54,8 +53,7 @@ class ElementSourcePolicyTests(unittest.TestCase):
                 "id": "image-1",
                 "type": "image",
                 "source": "/tmp/example.png",
-                "position": {"x": 0, "y": 0},
-                "size": {"width": 100, "height": 100},
+                "resolved_frame": {"x": 0, "y": 0, "width": 100, "height": 100},
                 "opacity": 1.0,
             },
         )

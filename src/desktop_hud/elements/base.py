@@ -22,11 +22,18 @@ class HudElement(ABC):
         self.id: str = config["id"]
         self.elem_type: str = config["type"]
 
+        resolved = config.get("resolved_frame", {}) if isinstance(config.get("resolved_frame"), dict) else {}
         pos = config.get("position", {})
-        self.position: tuple[int, int] = (pos.get("x", 0), pos.get("y", 0))
+        self.position: tuple[int, int] = (
+            int(resolved.get("x", pos.get("x", 0))),
+            int(resolved.get("y", pos.get("y", 0))),
+        )
 
         size = config.get("size", {})
-        self.size: tuple[int, int] = (size.get("width", 100), size.get("height", 100))
+        self.size: tuple[int, int] = (
+            int(resolved.get("width", size.get("width", 100))),
+            int(resolved.get("height", size.get("height", 100))),
+        )
 
         self.opacity: float = config.get("opacity", 1.0)
         self.config = config

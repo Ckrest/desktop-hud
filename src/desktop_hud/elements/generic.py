@@ -7,7 +7,7 @@ from typing import Any
 import gi
 
 gi.require_version("Gtk", "4.0")
-from gi.repository import Gtk
+from gi.repository import Gtk, Pango
 
 from desktop_hud.elements.base import HudElement
 from desktop_hud.keyboard_layouts import resolve_keyboard_layout
@@ -96,6 +96,7 @@ class ListElement(HudElement):
         action_id = row.get("action_id") or row.get("action")
         if action_id:
             button.set_name(str(action_id))
+        button._hud_row_payload = dict(row)
 
         content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         content.set_halign(Gtk.Align.FILL)
@@ -228,6 +229,10 @@ class KeyboardElement(HudElement):
     def create_widget(self) -> Gtk.Widget:
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         root.add_css_class("hud-keyboard")
+        try:
+            root.set_overflow(Gtk.Overflow.HIDDEN)
+        except Exception:
+            pass
 
         title_parts = [part for part in (self.config.get("profile"), self.config.get("layer")) if part]
         if title_parts:
@@ -238,16 +243,23 @@ class KeyboardElement(HudElement):
         fixed.set_hexpand(True)
         fixed.set_vexpand(True)
         fixed.add_css_class("hud-keyboard-layout")
+        try:
+            fixed.set_overflow(Gtk.Overflow.HIDDEN)
+        except Exception:
+            pass
 
         key_states = self._key_state_map()
-        unit = float(self.config.get("unit_px", 42))
         gap = float(self.config.get("gap_px", 4))
+        unit = self._unit_size(layout, gap, bool(title_parts), bool(self.config.get("legend")))
+        bounds_width, bounds_height = self._layout_bounds(layout, unit, gap)
+        fixed.set_size_request(bounds_width, bounds_height)
+
         for key in layout["keys"]:
-            widget = self._build_key(key, key_states.get(key["code"], {}))
             x = int(round(key["x"] * (unit + gap)))
             y = int(round(key["y"] * (unit + gap)))
             width = max(1, int(round(key["w"] * unit + max(0, key["w"] - 1) * gap)))
             height = max(1, int(round(key["h"] * unit + max(0, key["h"] - 1) * gap)))
+            widget = self._build_key(key, key_states.get(key["code"], {}), width, height)
             widget.set_size_request(width, height)
             fixed.put(widget, x, y)
 
@@ -257,13 +269,65 @@ class KeyboardElement(HudElement):
             legend_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
             legend_box.add_css_class("hud-keyboard-legend")
             for item in legend:
-                if isinstance(item, dict):
-                    legend_box.append(_label(item.get("label", item.get("state", "")), f"hud-key-{item.get('state', 'default')}", wrap=False))
-                else:
-                    legend_box.append(_label(item, "hud-keyboard-legend-item", wrap=False))
+                legend_box.append(self._build_legend_item(item))
             root.append(legend_box)
         self.widget = root
         return root
+
+    def _build_legend_item(self, item: Any) -> Gtk.Widget:
+        state = "default"
+        text = item
+        if isinstance(item, dict):
+            state = _text(item.get("state"), "default").strip().lower()
+            text = item.get("label", state)
+        if state not in self.VALID_STATES:
+            state = "default"
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        box.add_css_class("hud-key")
+        box.add_css_class("hud-keyboard-legend-item")
+        if state != "default":
+            box.add_css_class(f"hud-key-{state}")
+        label = _label(text, "hud-key-label", xalign=0.5, wrap=False)
+        box.append(label)
+        return box
+
+    def _available_size(self, has_title: bool, has_legend: bool) -> tuple[int, int]:
+        resolved = self.config.get("resolved_frame") if isinstance(self.config.get("resolved_frame"), dict) else {}
+        width = int(resolved.get("width") or self.config.get("size", {}).get("width") or self.size[0])
+        height = int(resolved.get("height") or self.config.get("size", {}).get("height") or self.size[1])
+        padding = int(self.config.get("padding_px", 28))
+        title_height = 24 if has_title else 0
+        legend_height = 30 if has_legend else 0
+        return max(1, width - padding), max(1, height - padding - title_height - legend_height)
+
+    @staticmethod
+    def _layout_units(layout: dict[str, Any]) -> tuple[float, float]:
+        max_right = 1.0
+        max_bottom = 1.0
+        for key in layout.get("keys") or []:
+            max_right = max(max_right, float(key.get("x", 0)) + float(key.get("w", 1)))
+            max_bottom = max(max_bottom, float(key.get("y", 0)) + float(key.get("h", 1)))
+        return max_right, max_bottom
+
+    def _unit_size(self, layout: dict[str, Any], gap: float, has_title: bool, has_legend: bool) -> float:
+        configured = self.config.get("unit_px")
+        if configured is not None:
+            return max(8.0, float(configured))
+
+        available_width, available_height = self._available_size(has_title, has_legend)
+        units_width, units_height = self._layout_units(layout)
+        width_gap = max(0.0, (units_width - 1.0) * gap)
+        height_gap = max(0.0, (units_height - 1.0) * gap)
+        unit_by_width = (available_width - width_gap) / units_width
+        unit_by_height = (available_height - height_gap) / units_height
+        return max(8.0, min(unit_by_width, unit_by_height))
+
+    def _layout_bounds(self, layout: dict[str, Any], unit: float, gap: float) -> tuple[int, int]:
+        units_width, units_height = self._layout_units(layout)
+        width = int(round(units_width * unit + max(0.0, units_width - 1.0) * gap))
+        height = int(round(units_height * unit + max(0.0, units_height - 1.0) * gap))
+        return max(1, width), max(1, height)
 
     def _key_state_map(self) -> dict[str, dict[str, Any]]:
         result: dict[str, dict[str, Any]] = {}
@@ -281,9 +345,18 @@ class KeyboardElement(HudElement):
                 result[str(key)] = item
         return result
 
-    def _build_key(self, layout_key: dict[str, Any], state_data: dict[str, Any]) -> Gtk.Widget:
+    def _build_key(self, layout_key: dict[str, Any], state_data: dict[str, Any], width: int, height: int) -> Gtk.Widget:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         box.add_css_class("hud-key")
+        box.set_size_request(width, height)
+        box.set_hexpand(False)
+        box.set_vexpand(False)
+        box.set_halign(Gtk.Align.START)
+        box.set_valign(Gtk.Align.START)
+        try:
+            box.set_overflow(Gtk.Overflow.HIDDEN)
+        except Exception:
+            pass
         state = _text(state_data.get("state"), "default").strip().lower()
         if state not in self.VALID_STATES:
             state = "default"
@@ -291,10 +364,22 @@ class KeyboardElement(HudElement):
             box.add_css_class(f"hud-key-{state}")
         box.set_tooltip_text(_text(state_data.get("label") or state_data.get("detail") or layout_key.get("label")))
 
-        box.append(_label(state_data.get("key_label") or layout_key.get("label"), "hud-key-label", xalign=0.5, wrap=False))
+        inner_width = max(1, width - 12)
+        label = _label(state_data.get("key_label") or layout_key.get("label"), "hud-key-label", xalign=0.5, wrap=False)
+        label.set_size_request(inner_width, -1)
+        label.set_max_width_chars(max(2, int(inner_width / 8)))
+        label.set_ellipsize(Pango.EllipsizeMode.END)
+        box.append(label)
+
         label = state_data.get("label")
         if label:
-            box.append(_label(label, "hud-key-action", xalign=0.5, wrap=True))
+            action = _label(label, "hud-key-action", xalign=0.5, wrap=True)
+            action.set_size_request(inner_width, -1)
+            action.set_max_width_chars(max(3, int(inner_width / 7)))
+            action.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            action.set_lines(max(1, int((height - 28) / 15)))
+            action.set_ellipsize(Pango.EllipsizeMode.END)
+            box.append(action)
         return box
 
     @staticmethod

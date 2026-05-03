@@ -36,6 +36,7 @@ from gi.repository import Gtk4LayerShell as LayerShell
 from desktop_hud.config import PACKAGE_DIR, load_config
 from desktop_hud.editor import EditController
 from desktop_hud.elements import ELEMENT_TYPES, ElementSkipRequested
+from desktop_hud.geometry import resolve_frame, resolve_stack_scene
 from desktop_hud.layouts import LayoutProfileError, LayoutProfileManager
 from desktop_hud.snap import Rect
 
@@ -84,6 +85,7 @@ class HudWindow(Gtk.Window):
         self._setup_container()
         self._setup_editor()
         self._setup_interaction_controller()
+        self.connect("notify::has-focus", self._on_focus_changed)
         self._load_startup_profiles()
 
         if self.editor.is_edit_mode():
@@ -125,11 +127,17 @@ class HudWindow(Gtk.Window):
         self._refresh_keyboard_mode()
 
     def _refresh_keyboard_mode(self):
-        keyboard_mode = (
-            LayerShell.KeyboardMode.ON_DEMAND
-            if self.editor.is_edit_mode() or self._interaction is not None
-            else LayerShell.KeyboardMode.NONE
-        )
+        if self._interaction is not None:
+            requested_mode = str(self._interaction.get("keyboard_mode") or "exclusive").lower()
+            keyboard_mode = (
+                LayerShell.KeyboardMode.ON_DEMAND
+                if requested_mode in {"on_demand", "on-demand", "demand"}
+                else LayerShell.KeyboardMode.EXCLUSIVE
+            )
+        elif self.editor.is_edit_mode():
+            keyboard_mode = LayerShell.KeyboardMode.ON_DEMAND
+        else:
+            keyboard_mode = LayerShell.KeyboardMode.NONE
         LayerShell.set_keyboard_mode(self, keyboard_mode)
 
     def _refresh_input_region(self):
@@ -166,6 +174,19 @@ class HudWindow(Gtk.Window):
         except Exception:
             log.exception("Could not update click-through state")
 
+    def _overlay_should_be_visible(self) -> bool:
+        return bool(self.elements) or self.editor.is_edit_mode() or self._interaction is not None
+
+    def _sync_overlay_visibility(self) -> None:
+        should_show = self._overlay_should_be_visible()
+        if should_show:
+            if not self.get_visible():
+                self.set_visible(True)
+            self.present()
+        elif self.get_visible():
+            self.set_visible(False)
+            log.info("Overlay window hidden because it has no visible work")
+
     def _setup_container(self):
         """Create transparent fixed container for absolute positioning."""
         self.set_decorated(False)
@@ -201,6 +222,10 @@ class HudWindow(Gtk.Window):
         key_controller.connect("key-released", self._on_interaction_key_released)
         self.add_controller(key_controller)
         self._interaction_key_controller = key_controller
+
+    def _on_focus_changed(self, *_args) -> None:
+        if self._interaction is not None and not self.has_focus():
+            self.release_interaction("focus_lost")
 
     def _load_startup_profiles(self):
         """Load elements from startup profiles and last-used geometry."""
@@ -294,6 +319,7 @@ class HudWindow(Gtk.Window):
     @staticmethod
     def _payload_summary(payload: dict, endpoint: str) -> dict:
         elements = payload.get("elements")
+        items = payload.get("items")
         return {
             "endpoint": endpoint,
             "timestamp": time.time(),
@@ -301,6 +327,9 @@ class HudWindow(Gtk.Window):
             "replace_namespace": payload.get("replace_namespace"),
             "ttl_ms": payload.get("ttl_ms"),
             "element_count": len(elements) if isinstance(elements, list) else None,
+            "item_count": len(items) if isinstance(items, list) else None,
+            "has_frame": isinstance(payload.get("frame"), dict),
+            "layout": (payload.get("layout") or {}).get("type") if isinstance(payload.get("layout"), dict) else None,
             "keys": sorted(str(key) for key in payload.keys()),
         }
 
@@ -320,6 +349,28 @@ class HudWindow(Gtk.Window):
         )
         self._element_failures = self._element_failures[-50:]
 
+    def _resolve_config_frame(self, cfg: dict) -> tuple[int, int, int, int]:
+        if isinstance(cfg.get("resolved_frame"), dict):
+            resolved = cfg["resolved_frame"]
+            x = int(resolved["x"])
+            y = int(resolved["y"])
+            width = int(resolved["width"])
+            height = int(resolved["height"])
+        else:
+            frame = cfg.get("frame")
+            if not isinstance(frame, dict):
+                raise ValueError("element frame is required")
+            viewport_width, viewport_height = self.get_viewport_size()
+            resolved = resolve_frame(frame, viewport_width, viewport_height).to_data()
+            x = int(resolved["x"])
+            y = int(resolved["y"])
+            width = int(resolved["width"])
+            height = int(resolved["height"])
+            cfg["resolved_frame"] = resolved
+        cfg["position"] = {"x": x, "y": y}
+        cfg["size"] = {"width": width, "height": height}
+        return x, y, width, height
+
     def _recreate_element_widget(self, elem_id: str, merged_config: dict) -> bool:
         """Rebuild an element widget in-place for backend-sensitive config updates."""
         record = self.elements.get(elem_id)
@@ -334,27 +385,20 @@ class HudWindow(Gtk.Window):
             return False
 
         try:
+            x, y, width, height = self._resolve_config_frame(merged_config)
             new_element = cls(merged_config)
             new_widget = new_element.create_widget()
         except ElementSkipRequested as exc:
             log.warning("Recreate skipped for element '%s': %s", elem_id, exc)
             return False
-        except Exception:
+        except Exception as exc:
             log.exception("Failed to recreate element '%s'", elem_id)
+            self._record_element_failure(str(elem_id), f"recreate exception: {exc}", merged_config)
             return False
 
         if new_widget is None:
             log.warning("Recreate produced no widget for element '%s'", elem_id)
             return False
-
-        pos = merged_config.get("position", {})
-        x = int(pos.get("x", old_element.position[0]))
-        y = int(pos.get("y", old_element.position[1]))
-
-        size = merged_config.get("size", {})
-        width = int(size.get("width", old_element.size[0]))
-        height = int(size.get("height", old_element.size[1]))
-        x, y, width, height = self._normalize_geometry(x, y, width, height)
 
         opacity = float(merged_config.get("opacity", old_element.opacity))
         new_widget.set_size_request(width, height)
@@ -394,6 +438,8 @@ class HudWindow(Gtk.Window):
 
     def _add_element(self, elem_cfg: dict) -> bool:
         cfg = dict(elem_cfg)
+        if not self.get_visible():
+            self.set_visible(True)
 
         source = cfg.pop("__source", "config")
         namespace = cfg.pop("__namespace", None)
@@ -412,6 +458,13 @@ class HudWindow(Gtk.Window):
             self._record_element_failure(str(elem_id), "duplicate element id", cfg)
             return False
 
+        try:
+            x, y, width, height = self._resolve_config_frame(cfg)
+        except Exception as exc:
+            log.warning("Invalid frame for element '%s': %s", elem_id, exc)
+            self._record_element_failure(str(elem_id), f"invalid frame: {exc}", cfg)
+            return False
+
         cls = ELEMENT_TYPES.get(elem_type)
         if cls is None:
             log.warning("Unknown element type '%s' for element '%s'", elem_type, elem_id)
@@ -424,15 +477,6 @@ class HudWindow(Gtk.Window):
             if content_widget is None:
                 log.info("Element '%s' was skipped by source policy", elem_id)
                 return False
-
-            pos = cfg.get("position", {})
-            x = int(pos.get("x", 0))
-            y = int(pos.get("y", 0))
-
-            size = cfg.get("size", {})
-            width = int(size.get("width", element.size[0]))
-            height = int(size.get("height", element.size[1]))
-            x, y, width, height = self._normalize_geometry(x, y, width, height)
 
             opacity = float(cfg.get("opacity", element.opacity))
 
@@ -464,6 +508,8 @@ class HudWindow(Gtk.Window):
             )
 
             self._attach_runtime_click_callback(elem_id, frame)
+            self._attach_widget_action_callbacks(elem_id, content_widget)
+            self._sync_overlay_visibility()
 
             # Verify position was actually applied
             from gi.repository import GLib
@@ -516,10 +562,51 @@ class HudWindow(Gtk.Window):
             record=record,
         )
 
+    def _attach_widget_action_callbacks(self, elem_id: str, widget: Gtk.Widget) -> None:
+        for child in self._walk_widget_tree(widget):
+            if not isinstance(child, Gtk.Button):
+                continue
+            row_payload = getattr(child, "_hud_row_payload", None)
+            if row_payload is None:
+                continue
+            child.connect("clicked", self._on_runtime_row_clicked, elem_id)
+
+    def _walk_widget_tree(self, widget: Gtk.Widget):
+        yield widget
+        child = widget.get_first_child()
+        while child is not None:
+            yield from self._walk_widget_tree(child)
+            child = child.get_next_sibling()
+
+    def _on_runtime_row_clicked(self, button: Gtk.Button, elem_id: str) -> None:
+        if self.editor.is_edit_mode():
+            return
+        record = self.elements.get(elem_id)
+        if record is None:
+            return
+        row_payload = getattr(button, "_hud_row_payload", {}) or {}
+        self._emit_callback(
+            "selection.changed",
+            {
+                "id": record.local_id or elem_id,
+                "global_id": elem_id,
+                "row": row_payload,
+                "action_id": row_payload.get("action_id") or row_payload.get("action"),
+                "key": row_payload.get("key"),
+            },
+            record=record,
+        )
+
     def remove_element(self, elem_id: str, autosave: bool = True) -> bool:
         record = self.elements.pop(elem_id, None)
         if record is None:
             return False
+
+        try:
+            record.frame.set_visible(False)
+            record.frame.queue_draw()
+        except Exception:
+            log.debug("Could not hide frame for element '%s' before removal", elem_id)
 
         self.editor.unregister_element(elem_id)
 
@@ -534,6 +621,11 @@ class HudWindow(Gtk.Window):
             record.element.destroy()
         except Exception:
             log.exception("Error destroying element '%s'", elem_id)
+
+        self.container.queue_draw()
+        self.queue_draw()
+        log.info("Removed element '%s'", elem_id)
+        self._sync_overlay_visibility()
 
         if autosave:
             self._maybe_autosave_last_used()
@@ -597,6 +689,8 @@ class HudWindow(Gtk.Window):
         failed: list[dict] = []
         with self._suspend_autosave():
             if replace:
+                self._cancel_transient_timer(namespace)
+            if replace:
                 for elem_id in self._namespace_element_ids(namespace):
                     self.remove_element(elem_id, autosave=False)
             for raw in elements:
@@ -623,6 +717,57 @@ class HudWindow(Gtk.Window):
             "element_count": len(self._namespace_element_ids(namespace)),
         }
 
+    def replace_overlay_scene(self, namespace: str, payload: dict) -> dict:
+        namespace = str(namespace).strip()
+        if not namespace:
+            return {"ok": False, "error_code": "namespace_required", "message": "namespace is required"}
+        if not isinstance(payload, dict):
+            return {"ok": False, "error_code": "payload_required", "message": "payload must be an object"}
+
+        ttl_ms_raw = payload.get("ttl_ms")
+        ttl_ms = int(ttl_ms_raw) if ttl_ms_raw is not None else None
+        transient = bool(payload.get("transient", False) or (ttl_ms is not None and ttl_ms > 0))
+
+        try:
+            viewport_width, viewport_height = self.get_viewport_size()
+            elements, scene_frame = resolve_stack_scene(payload, viewport_width, viewport_height)
+        except Exception as exc:
+            log.warning("Invalid overlay scene for namespace '%s': %s", namespace, exc)
+            return {
+                "ok": False,
+                "error_code": "invalid_scene",
+                "message": str(exc),
+                "namespace": namespace,
+            }
+
+        result = self.replace_namespace_elements(
+            namespace=namespace,
+            elements=elements,
+            replace=True,
+            source="overlay",
+            transient=transient,
+            autosave=not transient,
+        )
+        result["scene_frame"] = scene_frame.to_data()
+
+        if not result.get("ok"):
+            return result
+
+        if transient and ttl_ms is not None and ttl_ms > 0:
+            ttl_ms = max(1, ttl_ms)
+
+            def expire_namespace():
+                self.delete_namespace(namespace, autosave=False)
+                self._transient_timers.pop(namespace, None)
+                return False
+
+            self._cancel_transient_timer(namespace)
+            timer_id = GLib.timeout_add(ttl_ms, expire_namespace)
+            self._transient_timers[namespace] = int(timer_id)
+            result["ttl_ms"] = ttl_ms
+
+        return result
+
     def update_namespaced_element(self, namespace: str, local_id: str, updates: dict) -> bool:
         return self.update_element(self._global_element_id(namespace, local_id), updates)
 
@@ -634,6 +779,9 @@ class HudWindow(Gtk.Window):
                 if self.remove_element(elem_id, autosave=False):
                     removed.append(elem_id)
         self._cancel_transient_timer(namespace)
+        self.container.queue_draw()
+        self.queue_draw()
+        self._sync_overlay_visibility()
         if autosave:
             self._maybe_autosave_last_used()
         return {"ok": True, "namespace": namespace, "removed": len(removed)}
@@ -643,6 +791,7 @@ class HudWindow(Gtk.Window):
         ttl_ms = max(1, int(payload.get("ttl_ms", 3000)))
         replace = bool(payload.get("replace_namespace", True))
         elements = payload.get("elements") or []
+        self._cancel_transient_timer(namespace)
         result = self.replace_namespace_elements(
             namespace=namespace,
             elements=elements,
@@ -724,27 +873,49 @@ class HudWindow(Gtk.Window):
             element.opacity = opacity
             element.config["opacity"] = opacity
 
-        if "position" in updates or "size" in updates:
-            x, y = element.position
-            width, height = element.size
+        if any(key in updates for key in ("frame", "resolved_frame", "position", "size")):
+            if "frame" in updates or "resolved_frame" in updates:
+                merged_config.pop("position", None)
+                merged_config.pop("size", None)
+                if "frame" in updates:
+                    merged_config.pop("resolved_frame", None)
+                x, y, width, height = self._resolve_config_frame(merged_config)
+            else:
+                x, y = element.position
+                width, height = element.size
 
-            if "position" in updates:
-                pos = updates["position"]
-                x = int(pos.get("x", x))
-                y = int(pos.get("y", y))
+                if "position" in updates:
+                    pos = updates["position"]
+                    x = int(pos.get("x", x))
+                    y = int(pos.get("y", y))
 
-            if "size" in updates:
-                size = updates["size"]
-                width = int(size.get("width", width))
-                height = int(size.get("height", height))
+                if "size" in updates:
+                    size = updates["size"]
+                    width = int(size.get("width", width))
+                    height = int(size.get("height", height))
 
-            x, y, width, height = self._normalize_geometry(x, y, width, height)
+                x, y, width, height = self._normalize_geometry(x, y, width, height)
+                merged_config["frame"] = {
+                    "anchor": "top-left",
+                    "origin": "top-left",
+                    "offset": {"x": f"{x}px", "y": f"{y}px"},
+                    "width": f"{width}px",
+                    "height": f"{height}px",
+                }
+                merged_config["resolved_frame"] = {
+                    "x": x,
+                    "y": y,
+                    "width": width,
+                    "height": height,
+                }
+
             self.container.move(record.frame, x, y)
             content_widget.set_size_request(width, height)
             record.frame.set_size_request(width, height)
 
             element.position = (x, y)
             element.size = (width, height)
+            element.config = merged_config
             element.config["position"] = {"x": x, "y": y}
             element.config["size"] = {"width": width, "height": height}
             updated_rect = Rect(x=x, y=y, width=width, height=height)
@@ -832,6 +1003,7 @@ class HudWindow(Gtk.Window):
     def _on_editor_mode_changed(self, enabled: bool) -> None:
         self._refresh_keyboard_mode()
         self._refresh_input_region()
+        self._sync_overlay_visibility()
         if enabled:
             try:
                 self.set_focusable(True)
@@ -874,10 +1046,12 @@ class HudWindow(Gtk.Window):
 
         surface = self.get_surface()
         if surface is not None:
-            width = max(1, int(surface.get_width()))
-            height = max(1, int(surface.get_height()))
-            log.debug("Viewport size: %dx%d (source: surface)", width, height)
-            return width, height
+            width = int(surface.get_width())
+            height = int(surface.get_height())
+            if width >= 100 and height >= 100:
+                log.debug("Viewport size: %dx%d (source: surface)", width, height)
+                return width, height
+            log.debug("Ignoring transient surface size: %dx%d", width, height)
 
         display = Gdk.Display.get_default()
         if display is not None:
@@ -898,29 +1072,59 @@ class HudWindow(Gtk.Window):
         log.debug("Viewport size: 1920x1080 (source: fallback)")
         return (1920, 1080)
 
+    def get_viewport_info(self) -> dict:
+        viewport_width, viewport_height = self.get_viewport_size()
+        display = Gdk.Display.get_default()
+        monitors = []
+        if display is not None and hasattr(display, "get_monitors"):
+            model = display.get_monitors()
+            for index in range(model.get_n_items()):
+                monitor = model.get_item(index)
+                if monitor is None:
+                    continue
+                geometry = monitor.get_geometry()
+                monitors.append(
+                    {
+                        "index": index,
+                        "width": int(geometry.width),
+                        "height": int(geometry.height),
+                        "x": int(geometry.x),
+                        "y": int(geometry.y),
+                    },
+                )
+        return {
+            "viewport": {"width": viewport_width, "height": viewport_height},
+            "monitors": monitors,
+        }
+
     def grab_interaction(self, payload: dict) -> dict:
+        namespace = str(payload.get("namespace", "")).strip() or None
         if self._interaction is not None:
+            if namespace and namespace == self._interaction.get("namespace"):
+                self._interaction["clear_namespace_on_release"] = False
             self.release_interaction("replaced")
 
         timeout_ms = int(payload.get("timeout_ms", payload.get("ttl_ms", 10000)))
         timeout_ms = max(100, timeout_ms)
-        namespace = str(payload.get("namespace", "")).strip() or None
         self._interaction = {
             "namespace": namespace,
             "callback_url": payload.get("callback_url"),
             "callback_events": payload.get("callback_events") or [],
             "correlation_id": payload.get("correlation_id"),
             "escape_releases": bool(payload.get("escape_releases", True)),
+            "clear_namespace_on_release": bool(payload.get("clear_namespace_on_release", False)),
+            "keyboard_mode": str(payload.get("keyboard_mode", "exclusive")),
             "started_at": time.time(),
             "timeout_ms": timeout_ms,
             "last_event": None,
         }
         self.set_focusable(True)
+        self._refresh_keyboard_mode()
+        self.present()
         try:
             focused = bool(self.grab_focus())
         except Exception:
             focused = False
-        self._refresh_keyboard_mode()
         self._refresh_input_region()
 
         def timeout_release():
@@ -938,6 +1142,7 @@ class HudWindow(Gtk.Window):
 
     def release_interaction(self, reason: str = "released") -> dict:
         was_active = self._interaction is not None
+        namespace_to_clear = None
         if self._interaction_timer is not None:
             try:
                 GLib.source_remove(self._interaction_timer)
@@ -948,10 +1153,26 @@ class HudWindow(Gtk.Window):
             event = "interaction.cancelled" if reason in {"escape", "cancelled"} else "interaction.focus_lost" if reason == "focus_lost" else None
             if event:
                 self._emit_callback(event, {"reason": reason})
+        if self._interaction is not None and self._interaction.get("clear_namespace_on_release"):
+            namespace_to_clear = self._interaction.get("namespace")
         self._interaction = None
+        if namespace_to_clear:
+            self.delete_namespace(str(namespace_to_clear), autosave=False)
         self._refresh_keyboard_mode()
         self._refresh_input_region()
-        return {"ok": True, "was_active": was_active, "reason": reason}
+        self._sync_overlay_visibility()
+        log.info(
+            "Released interaction reason=%s was_active=%s cleared_namespace=%s",
+            reason,
+            was_active,
+            namespace_to_clear,
+        )
+        return {
+            "ok": True,
+            "was_active": was_active,
+            "reason": reason,
+            "cleared_namespace": namespace_to_clear,
+        }
 
     def get_interaction_status(self) -> dict:
         if self._interaction is None:
@@ -965,6 +1186,8 @@ class HudWindow(Gtk.Window):
             "timeout_ms": timeout_ms,
             "remaining_ms": max(0, timeout_ms - elapsed_ms),
             "escape_releases": bool(self._interaction.get("escape_releases", True)),
+            "clear_namespace_on_release": bool(self._interaction.get("clear_namespace_on_release", False)),
+            "keyboard_mode": self._interaction.get("keyboard_mode"),
             "focused": bool(self.has_focus()),
         }
 
@@ -980,7 +1203,6 @@ class HudWindow(Gtk.Window):
         }
         self._interaction["last_event"] = payload
         if keyval == Gdk.KEY_Escape and self._interaction.get("escape_releases", True):
-            self._emit_callback("interaction.cancelled", {**payload, "reason": "escape"})
             self.release_interaction("escape")
             return True
         self._emit_callback("interaction.key_pressed", payload)
@@ -1052,25 +1274,7 @@ class HudWindow(Gtk.Window):
         threading.Thread(target=post_callback, daemon=True).start()
 
     def get_diagnostics(self) -> dict:
-        viewport_width, viewport_height = self.get_viewport_size()
-        display = Gdk.Display.get_default()
-        monitors = []
-        if display is not None and hasattr(display, "get_monitors"):
-            model = display.get_monitors()
-            for index in range(model.get_n_items()):
-                monitor = model.get_item(index)
-                if monitor is None:
-                    continue
-                geometry = monitor.get_geometry()
-                monitors.append(
-                    {
-                        "index": index,
-                        "width": int(geometry.width),
-                        "height": int(geometry.height),
-                        "x": int(geometry.x),
-                        "y": int(geometry.y),
-                    }
-                )
+        viewport_info = self.get_viewport_info()
         return {
             "namespaces": self.list_namespaces()["namespaces"],
             "elements": {
@@ -1085,25 +1289,37 @@ class HudWindow(Gtk.Window):
             "last_callback_failures": list(self._last_callback_failures),
             "render_failures": list(self._render_failures),
             "element_failures": list(self._element_failures),
-            "viewport": {"width": viewport_width, "height": viewport_height},
-            "monitors": monitors,
+            "viewport": viewport_info["viewport"],
+            "monitors": viewport_info["monitors"],
         }
 
     def get_namespace_diagnostics(self, namespace: str) -> dict:
         element_ids = self._namespace_element_ids(namespace)
+        elements = []
+        for elem_id in element_ids:
+            record = self.elements[elem_id]
+            alloc = record.frame.get_allocation()
+            elements.append(
+                {
+                    "id": record.local_id or elem_id,
+                    "global_id": elem_id,
+                    "type": getattr(record.element, "elem_type", None),
+                    "transient": record.transient,
+                    "source": record.source,
+                    "frame": record.element.config.get("frame"),
+                    "resolved_frame": record.element.config.get("resolved_frame"),
+                    "actual_allocation": {
+                        "x": int(alloc.x),
+                        "y": int(alloc.y),
+                        "width": int(alloc.width),
+                        "height": int(alloc.height),
+                    },
+                },
+            )
         return {
             "namespace": namespace,
             "element_count": len(element_ids),
-            "elements": [
-                {
-                    "id": self.elements[elem_id].local_id or elem_id,
-                    "global_id": elem_id,
-                    "type": getattr(self.elements[elem_id].element, "elem_type", None),
-                    "transient": self.elements[elem_id].transient,
-                    "source": self.elements[elem_id].source,
-                }
-                for elem_id in element_ids
-            ],
+            "elements": elements,
             "timer_active": namespace in self._transient_timers,
         }
 
@@ -1308,6 +1524,7 @@ class HudWindow(Gtk.Window):
         self.editor.set_edit_mode(bool(self.config.get("overlay", {}).get("edit_mode", False)))
         self.editor.refresh_all()
         self._refresh_input_region()
+        self._sync_overlay_visibility()
         self._maybe_autosave_last_used()
 
         log.info("Config reloaded: %d elements active", len(self.elements))
@@ -1326,6 +1543,19 @@ class HudWindow(Gtk.Window):
             # Overlay current runtime geometry
             entry["position"] = {"x": int(element.position[0]), "y": int(element.position[1])}
             entry["size"] = {"width": int(element.size[0]), "height": int(element.size[1])}
+            entry["resolved_frame"] = {
+                "x": int(element.position[0]),
+                "y": int(element.position[1]),
+                "width": int(element.size[0]),
+                "height": int(element.size[1]),
+            }
+            alloc = record.frame.get_allocation()
+            entry["actual_allocation"] = {
+                "x": int(alloc.x),
+                "y": int(alloc.y),
+                "width": int(alloc.width),
+                "height": int(alloc.height),
+            }
             entry["opacity"] = float(element.opacity)
             entry["__source"] = record.source
             entry["editable"] = record.editable
@@ -1346,6 +1576,7 @@ class HudApplication(Gtk.Application):
         self.cli_no_last_used: bool = False
 
     def do_activate(self):
+        self.hold()
         config = load_config()
 
         if self.cli_profiles:
@@ -1357,7 +1588,7 @@ class HudApplication(Gtk.Application):
             config.setdefault("layouts", {})["autosave_last_used"] = False
 
         self.window = HudWindow(self, config)
-        self.window.present()
+        self.window._sync_overlay_visibility()
 
         api_cfg = config.get("api", {})
         if api_cfg.get("enabled", False):

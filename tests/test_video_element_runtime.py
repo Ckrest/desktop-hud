@@ -8,8 +8,7 @@ def _video_config(**overrides):
         "id": "video-test",
         "type": "video",
         "source": "/tmp/example.mp4",
-        "position": {"x": 0, "y": 0},
-        "size": {"width": 100, "height": 100},
+        "resolved_frame": {"x": 0, "y": 0, "width": 100, "height": 100},
         "opacity": 1.0,
     }
     cfg.update(overrides)
@@ -40,7 +39,15 @@ class VideoElementRuntimeTests(unittest.TestCase):
         elem = VideoElement(_video_config())
         self.assertFalse(
             elem.runtime_update_requires_recreate(
-                {"position": {"x": 10, "y": 20}, "size": {"width": 200, "height": 120}},
+                {
+                    "frame": {
+                        "anchor": "top-left",
+                        "origin": "top-left",
+                        "offset": {"x": "10px", "y": "20px"},
+                        "width": "200px",
+                        "height": "120px",
+                    },
+                },
             ),
         )
 

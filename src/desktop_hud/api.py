@@ -7,6 +7,7 @@ import logging
 import threading
 from functools import partial
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import unquote, urlparse
 
 from gi.repository import GLib
 
@@ -40,7 +41,7 @@ class HudAPIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _read_body(self) -> dict:
+    def _read_body(self):
         length = int(self.headers.get("Content-Length", 0))
         if length == 0:
             return {}
@@ -121,39 +122,95 @@ class HudAPIHandler(BaseHTTPRequestHandler):
         return None
 
     def do_GET(self):
-        if self.path == "/health":
+        path = urlparse(self.path).path
+
+        if path == "/health":
             self._send_json({"status": "ok"})
             return
 
-        if self.path == "/elements":
-            elements = self._dispatch_value_or_error(self.hud_window.get_elements_info)
+        if path == "/elements":
+            elements = self._dispatch_value_or_error(self.hud_window.get_elements_info, True)
             if elements is self._DISPATCH_FAILED:
                 return
             self._send_json({"elements": elements or []})
             return
 
-        if self.path == "/mode":
+        if path == "/viewport":
+            viewport = self._dispatch_value_or_error(self.hud_window.get_viewport_info)
+            if viewport is self._DISPATCH_FAILED:
+                return
+            self._send_json(viewport)
+            return
+
+        if path == "/overlays":
+            namespaces = self._dispatch_value_or_error(self.hud_window.list_namespaces)
+            if namespaces is self._DISPATCH_FAILED:
+                return
+            self._send_json(namespaces)
+            return
+
+        if path.startswith("/overlays/"):
+            namespace = unquote(path.removeprefix("/overlays/").strip("/"))
+            if not namespace or "/" in namespace:
+                self._send_json({"error": "not found"}, 404)
+                return
+            diagnostics = self._dispatch_value_or_error(self.hud_window.get_namespace_diagnostics, namespace)
+            if diagnostics is self._DISPATCH_FAILED:
+                return
+            self._send_json(diagnostics)
+            return
+
+        if path == "/namespaces":
+            namespaces = self._dispatch_value_or_error(self.hud_window.list_namespaces)
+            if namespaces is self._DISPATCH_FAILED:
+                return
+            self._send_json(namespaces)
+            return
+
+        if path == "/diagnostics":
+            diagnostics = self._dispatch_value_or_error(self.hud_window.get_diagnostics)
+            if diagnostics is self._DISPATCH_FAILED:
+                return
+            self._send_json(diagnostics)
+            return
+
+        if path.startswith("/namespaces/") and path.endswith("/diagnostics"):
+            namespace = unquote(path.removeprefix("/namespaces/").removesuffix("/diagnostics").strip("/"))
+            diagnostics = self._dispatch_value_or_error(self.hud_window.get_namespace_diagnostics, namespace)
+            if diagnostics is self._DISPATCH_FAILED:
+                return
+            self._send_json(diagnostics)
+            return
+
+        if path == "/interaction/status":
+            status = self._dispatch_value_or_error(self.hud_window.get_interaction_status)
+            if status is self._DISPATCH_FAILED:
+                return
+            self._send_json(status)
+            return
+
+        if path == "/mode":
             mode_info = self._dispatch_value_or_error(self.hud_window.get_mode_info)
             if mode_info is self._DISPATCH_FAILED:
                 return
             self._send_json(mode_info)
             return
 
-        if self.path == "/mode/diagnostics":
+        if path == "/mode/diagnostics":
             diagnostics = self._dispatch_value_or_error(self.hud_window.get_mode_diagnostics)
             if diagnostics is self._DISPATCH_FAILED:
                 return
             self._send_json(diagnostics)
             return
 
-        if self.path == "/profiles":
+        if path == "/profiles":
             profiles = self._dispatch_value_or_error(self.hud_window.list_profiles)
             if profiles is self._DISPATCH_FAILED:
                 return
             self._send_json(profiles)
             return
 
-        if self.path == "/profiles/current":
+        if path == "/profiles/current":
             snapshot = self._dispatch_value_or_error(self.hud_window.get_current_layout_snapshot)
             if snapshot is self._DISPATCH_FAILED:
                 return
@@ -163,13 +220,17 @@ class HudAPIHandler(BaseHTTPRequestHandler):
         self._send_json({"error": "not found"}, 404)
 
     def do_POST(self):
+        path = urlparse(self.path).path
         try:
             body = self._read_body()
         except ValueError as exc:
             self._send_json({"error": "invalid_json", "message": str(exc)}, 400)
             return
 
-        if self.path == "/elements":
+        if isinstance(body, dict) and hasattr(self.hud_window, "record_api_payload"):
+            self._dispatch_value_or_error(self.hud_window.record_api_payload, path, body)
+
+        if path == "/elements":
             ok = self._dispatch_value_or_error(self.hud_window._add_element, body)
             if ok is self._DISPATCH_FAILED:
                 return
@@ -179,7 +240,72 @@ class HudAPIHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": "failed to add element"}, 400)
             return
 
-        if self.path == "/reload":
+        if path.startswith("/namespaces/") and path.endswith("/elements"):
+            namespace = unquote(path.removeprefix("/namespaces/").removesuffix("/elements").strip("/"))
+            elements = body if isinstance(body, list) else body.get("elements", [])
+            replace = bool(body.get("replace_namespace", not bool(body.get("append")))) if isinstance(body, dict) else True
+            result = self._dispatch_value_or_error(
+                self.hud_window.replace_namespace_elements,
+                namespace,
+                elements,
+                replace,
+            )
+            if result is self._DISPATCH_FAILED:
+                return
+            payload = self._ensure_dict_result(result, path)
+            if payload is None:
+                return
+            self._send_json(payload, 201 if payload.get("ok") else 400)
+            return
+
+        if path.startswith("/overlays/"):
+            namespace = unquote(path.removeprefix("/overlays/").strip("/"))
+            if not namespace or "/" in namespace:
+                self._send_json({"error": "not found"}, 404)
+                return
+            result = self._dispatch_value_or_error(self.hud_window.replace_overlay_scene, namespace, body)
+            if result is self._DISPATCH_FAILED:
+                return
+            payload = self._ensure_dict_result(result, path)
+            if payload is None:
+                return
+            self._send_json(payload, 201 if payload.get("ok") else 400)
+            return
+
+        if path == "/transient":
+            result = self._dispatch_value_or_error(self.hud_window.create_transient, body)
+            if result is self._DISPATCH_FAILED:
+                return
+            payload = self._ensure_dict_result(result, "/transient")
+            if payload is None:
+                return
+            self._send_json(payload, 201 if payload.get("ok") else 400)
+            return
+
+        if path == "/interaction/grab":
+            result = self._dispatch_value_or_error(self.hud_window.grab_interaction, body)
+            if result is self._DISPATCH_FAILED:
+                return
+            payload = self._ensure_dict_result(result, "/interaction/grab")
+            if payload is None:
+                return
+            self._send_json(payload)
+            return
+
+        if path == "/interaction/release":
+            result = self._dispatch_value_or_error(
+                self.hud_window.release_interaction,
+                str(body.get("reason", "released")),
+            )
+            if result is self._DISPATCH_FAILED:
+                return
+            payload = self._ensure_dict_result(result, "/interaction/release")
+            if payload is None:
+                return
+            self._send_json(payload)
+            return
+
+        if path == "/reload":
             from desktop_hud.config import load_config
 
             config = load_config()
@@ -189,7 +315,7 @@ class HudAPIHandler(BaseHTTPRequestHandler):
             self._send_json({"status": "reloaded"})
             return
 
-        if self.path == "/mode":
+        if path == "/mode":
             if "edit_mode" not in body:
                 self._send_json({"error": "edit_mode is required"}, 400)
                 return
@@ -204,7 +330,7 @@ class HudAPIHandler(BaseHTTPRequestHandler):
             self._send_json(payload)
             return
 
-        if self.path == "/profiles/switch":
+        if path == "/profiles/switch":
             name = str(body.get("name", "")).strip()
             if not name:
                 self._send_json({"error": "name is required"}, 400)
@@ -224,7 +350,7 @@ class HudAPIHandler(BaseHTTPRequestHandler):
             self._send_json(payload, status)
             return
 
-        if self.path == "/profiles/add":
+        if path == "/profiles/add":
             name = str(body.get("name", "")).strip()
             if not name:
                 self._send_json({"error": "name is required"}, 400)
@@ -244,7 +370,7 @@ class HudAPIHandler(BaseHTTPRequestHandler):
             self._send_json(payload, status)
             return
 
-        if self.path == "/profiles/save":
+        if path == "/profiles/save":
             name = str(body.get("name", "")).strip()
             if not name:
                 self._send_json({"error": "name is required"}, 400)
@@ -263,7 +389,7 @@ class HudAPIHandler(BaseHTTPRequestHandler):
             self._send_json(payload, 400)
             return
 
-        if self.path == "/profiles/save-last-used":
+        if path == "/profiles/save-last-used":
             result = self._dispatch_value_or_error(self.hud_window.save_last_used_profile)
             if result is self._DISPATCH_FAILED:
                 return
@@ -280,8 +406,9 @@ class HudAPIHandler(BaseHTTPRequestHandler):
         self._send_json({"error": "not found"}, 404)
 
     def do_DELETE(self):
-        if self.path.startswith("/elements/"):
-            elem_id = self.path.split("/elements/", 1)[1]
+        path = urlparse(self.path).path
+        if path.startswith("/elements/"):
+            elem_id = unquote(path.split("/elements/", 1)[1])
             ok = self._dispatch_value_or_error(self.hud_window.remove_element, elem_id)
             if ok is self._DISPATCH_FAILED:
                 return
@@ -291,10 +418,75 @@ class HudAPIHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": "element not found"}, 404)
             return
 
+        if path.startswith("/namespaces/"):
+            namespace = unquote(path.removeprefix("/namespaces/").strip("/"))
+            if not namespace or "/" in namespace:
+                self._send_json({"error": "not found"}, 404)
+                return
+            result = self._dispatch_value_or_error(self.hud_window.delete_namespace, namespace)
+            if result is self._DISPATCH_FAILED:
+                return
+            payload = self._ensure_dict_result(result, path)
+            if payload is None:
+                return
+            self._send_json(payload)
+            return
+
+        if path.startswith("/overlays/"):
+            namespace = unquote(path.removeprefix("/overlays/").strip("/"))
+            if not namespace or "/" in namespace:
+                self._send_json({"error": "not found"}, 404)
+                return
+            result = self._dispatch_value_or_error(self.hud_window.delete_namespace, namespace)
+            if result is self._DISPATCH_FAILED:
+                return
+            payload = self._ensure_dict_result(result, path)
+            if payload is None:
+                return
+            self._send_json(payload)
+            return
+
+        self._send_json({"error": "not found"}, 404)
+
+    def do_PUT(self):
+        path = urlparse(self.path).path
+        try:
+            body = self._read_body()
+        except ValueError as exc:
+            self._send_json({"error": "invalid_json", "message": str(exc)}, 400)
+            return
+
+        if isinstance(body, dict) and hasattr(self.hud_window, "record_api_payload"):
+            self._dispatch_value_or_error(self.hud_window.record_api_payload, path, body)
+
+        if path.startswith("/overlays/"):
+            namespace = unquote(path.removeprefix("/overlays/").strip("/"))
+            if not namespace or "/" in namespace:
+                self._send_json({"error": "not found"}, 404)
+                return
+            result = self._dispatch_value_or_error(self.hud_window.replace_overlay_scene, namespace, body)
+            if result is self._DISPATCH_FAILED:
+                return
+            payload = self._ensure_dict_result(result, path)
+            if payload is None:
+                return
+            self._send_json(payload, 201 if payload.get("ok") else 400)
+            return
+
         self._send_json({"error": "not found"}, 404)
 
     def do_PATCH(self):
-        if not self.path.startswith("/elements/"):
+        path = urlparse(self.path).path
+
+        namespace = None
+        elem_id = None
+        if path.startswith("/elements/"):
+            elem_id = unquote(path.split("/elements/", 1)[1])
+        elif path.startswith("/namespaces/") and "/elements/" in path:
+            prefix, elem_id_part = path.removeprefix("/namespaces/").split("/elements/", 1)
+            namespace = unquote(prefix.strip("/"))
+            elem_id = f"{namespace}:{unquote(elem_id_part.strip('/'))}"
+        else:
             self._send_json({"error": "not found"}, 404)
             return
 
@@ -304,7 +496,6 @@ class HudAPIHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "invalid_json", "message": str(exc)}, 400)
             return
 
-        elem_id = self.path.split("/elements/", 1)[1]
         exists = self._dispatch_value_or_error(self.hud_window.has_element, elem_id)
         if exists is self._DISPATCH_FAILED:
             return
@@ -312,7 +503,7 @@ class HudAPIHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "element not found"}, 404)
             return
 
-        geometry_update = "position" in updates or "size" in updates
+        geometry_update = "frame" in updates or "resolved_frame" in updates
 
         if geometry_update:
             editable = self._dispatch_value_or_error(self.hud_window.is_element_editable, elem_id)
