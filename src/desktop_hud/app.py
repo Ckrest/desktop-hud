@@ -539,6 +539,140 @@ class HudWindow(Gtk.Window):
             self._maybe_autosave_last_used()
         return True
 
+    def _prepare_namespaced_element(
+        self,
+        namespace: str,
+        elem_cfg: dict,
+        source: str = "api",
+        transient: bool = False,
+    ) -> dict:
+        local_id = str(elem_cfg.get("id", "")).strip()
+        if not local_id:
+            raise ValueError("Namespaced element is missing id")
+        cfg = dict(elem_cfg)
+        cfg["id"] = self._global_element_id(namespace, local_id)
+        cfg["__namespace"] = namespace
+        cfg["__local_id"] = local_id
+        cfg["__source"] = source
+        cfg["__transient"] = transient
+        return cfg
+
+    def _namespace_element_ids(self, namespace: str) -> list[str]:
+        return [
+            elem_id
+            for elem_id, record in self.elements.items()
+            if record.namespace == namespace
+        ]
+
+    def list_namespaces(self) -> dict:
+        namespaces: dict[str, dict] = {}
+        for record in self.elements.values():
+            if not record.namespace:
+                continue
+            entry = namespaces.setdefault(
+                record.namespace,
+                {"namespace": record.namespace, "element_count": 0, "transient_count": 0},
+            )
+            entry["element_count"] += 1
+            if record.transient:
+                entry["transient_count"] += 1
+        return {"namespaces": sorted(namespaces.values(), key=lambda item: item["namespace"])}
+
+    def replace_namespace_elements(
+        self,
+        namespace: str,
+        elements: list[dict],
+        replace: bool = True,
+        source: str = "api",
+        transient: bool = False,
+        autosave: bool = True,
+    ) -> dict:
+        namespace = str(namespace).strip()
+        if not namespace:
+            return {"ok": False, "error_code": "namespace_required", "message": "namespace is required"}
+        if not isinstance(elements, list):
+            return {"ok": False, "error_code": "elements_required", "message": "elements must be a list"}
+
+        added: list[str] = []
+        failed: list[dict] = []
+        with self._suspend_autosave():
+            if replace:
+                for elem_id in self._namespace_element_ids(namespace):
+                    self.remove_element(elem_id, autosave=False)
+            for raw in elements:
+                if not isinstance(raw, dict):
+                    failed.append({"id": None, "message": "element must be an object"})
+                    continue
+                try:
+                    cfg = self._prepare_namespaced_element(namespace, raw, source=source, transient=transient)
+                except ValueError as exc:
+                    failed.append({"id": raw.get("id"), "message": str(exc)})
+                    continue
+                if self._add_element(cfg):
+                    added.append(str(raw.get("id")))
+                else:
+                    failed.append({"id": raw.get("id"), "message": "failed to create element"})
+
+        if autosave and not transient:
+            self._maybe_autosave_last_used()
+        return {
+            "ok": not failed,
+            "namespace": namespace,
+            "added": added,
+            "failed": failed,
+            "element_count": len(self._namespace_element_ids(namespace)),
+        }
+
+    def update_namespaced_element(self, namespace: str, local_id: str, updates: dict) -> bool:
+        return self.update_element(self._global_element_id(namespace, local_id), updates)
+
+    def delete_namespace(self, namespace: str, autosave: bool = True) -> dict:
+        namespace = str(namespace).strip()
+        removed = []
+        with self._suspend_autosave():
+            for elem_id in self._namespace_element_ids(namespace):
+                if self.remove_element(elem_id, autosave=False):
+                    removed.append(elem_id)
+        self._cancel_transient_timer(namespace)
+        if autosave:
+            self._maybe_autosave_last_used()
+        return {"ok": True, "namespace": namespace, "removed": len(removed)}
+
+    def create_transient(self, payload: dict) -> dict:
+        namespace = str(payload.get("namespace", "transient")).strip()
+        ttl_ms = max(1, int(payload.get("ttl_ms", 3000)))
+        replace = bool(payload.get("replace_namespace", True))
+        elements = payload.get("elements") or []
+        result = self.replace_namespace_elements(
+            namespace=namespace,
+            elements=elements,
+            replace=replace,
+            source="transient",
+            transient=True,
+            autosave=False,
+        )
+        if not result.get("ok"):
+            return result
+        self._cancel_transient_timer(namespace)
+
+        def expire_namespace():
+            self.delete_namespace(namespace, autosave=False)
+            self._transient_timers.pop(namespace, None)
+            return False
+
+        timer_id = GLib.timeout_add(ttl_ms, expire_namespace)
+        self._transient_timers[namespace] = int(timer_id)
+        result["ttl_ms"] = ttl_ms
+        return result
+
+    def _cancel_transient_timer(self, namespace: str) -> None:
+        timer_id = self._transient_timers.pop(namespace, None)
+        if timer_id is not None:
+            try:
+                GLib.source_remove(timer_id)
+            except Exception:
+                log.debug("Transient timer %s was already removed", timer_id)
+
     def update_element(
         self,
         elem_id: str,
@@ -764,6 +898,215 @@ class HudWindow(Gtk.Window):
         log.debug("Viewport size: 1920x1080 (source: fallback)")
         return (1920, 1080)
 
+    def grab_interaction(self, payload: dict) -> dict:
+        if self._interaction is not None:
+            self.release_interaction("replaced")
+
+        timeout_ms = int(payload.get("timeout_ms", payload.get("ttl_ms", 10000)))
+        timeout_ms = max(100, timeout_ms)
+        namespace = str(payload.get("namespace", "")).strip() or None
+        self._interaction = {
+            "namespace": namespace,
+            "callback_url": payload.get("callback_url"),
+            "callback_events": payload.get("callback_events") or [],
+            "correlation_id": payload.get("correlation_id"),
+            "escape_releases": bool(payload.get("escape_releases", True)),
+            "started_at": time.time(),
+            "timeout_ms": timeout_ms,
+            "last_event": None,
+        }
+        self.set_focusable(True)
+        try:
+            focused = bool(self.grab_focus())
+        except Exception:
+            focused = False
+        self._refresh_keyboard_mode()
+        self._refresh_input_region()
+
+        def timeout_release():
+            if self._interaction is not None:
+                self._emit_callback("interaction.timeout", {"reason": "timeout"})
+                self.release_interaction("timeout")
+            return False
+
+        self._interaction_timer = int(GLib.timeout_add(timeout_ms, timeout_release))
+        return {
+            "ok": True,
+            "focused": focused or bool(self.has_focus()),
+            "interaction": self.get_interaction_status(),
+        }
+
+    def release_interaction(self, reason: str = "released") -> dict:
+        was_active = self._interaction is not None
+        if self._interaction_timer is not None:
+            try:
+                GLib.source_remove(self._interaction_timer)
+            except Exception:
+                log.debug("Interaction timer %s was already removed", self._interaction_timer)
+            self._interaction_timer = None
+        if self._interaction is not None and reason not in {"timeout"}:
+            event = "interaction.cancelled" if reason in {"escape", "cancelled"} else "interaction.focus_lost" if reason == "focus_lost" else None
+            if event:
+                self._emit_callback(event, {"reason": reason})
+        self._interaction = None
+        self._refresh_keyboard_mode()
+        self._refresh_input_region()
+        return {"ok": True, "was_active": was_active, "reason": reason}
+
+    def get_interaction_status(self) -> dict:
+        if self._interaction is None:
+            return {"active": False}
+        elapsed_ms = int((time.time() - float(self._interaction.get("started_at", time.time()))) * 1000)
+        timeout_ms = int(self._interaction.get("timeout_ms", 0))
+        return {
+            "active": True,
+            "namespace": self._interaction.get("namespace"),
+            "correlation_id": self._interaction.get("correlation_id"),
+            "timeout_ms": timeout_ms,
+            "remaining_ms": max(0, timeout_ms - elapsed_ms),
+            "escape_releases": bool(self._interaction.get("escape_releases", True)),
+            "focused": bool(self.has_focus()),
+        }
+
+    def _on_interaction_key_pressed(self, _controller, keyval, keycode, state) -> bool:
+        if self._interaction is None:
+            return False
+        name = Gdk.keyval_name(keyval) or str(keyval)
+        payload = {
+            "key": name,
+            "keyval": int(keyval),
+            "keycode": int(keycode),
+            "state": int(state),
+        }
+        self._interaction["last_event"] = payload
+        if keyval == Gdk.KEY_Escape and self._interaction.get("escape_releases", True):
+            self._emit_callback("interaction.cancelled", {**payload, "reason": "escape"})
+            self.release_interaction("escape")
+            return True
+        self._emit_callback("interaction.key_pressed", payload)
+        return True
+
+    def _on_interaction_key_released(self, _controller, keyval, keycode, state) -> bool:
+        if self._interaction is None:
+            return False
+        self._emit_callback(
+            "interaction.key_released",
+            {
+                "key": Gdk.keyval_name(keyval) or str(keyval),
+                "keyval": int(keyval),
+                "keycode": int(keycode),
+                "state": int(state),
+            },
+        )
+        return True
+
+    def _emit_callback(self, event: str, payload: dict, record: ElementRecord | None = None) -> None:
+        context = self._interaction or {}
+        callback_url = context.get("callback_url")
+        callback_events = context.get("callback_events") or []
+        correlation_id = context.get("correlation_id")
+        namespace = context.get("namespace")
+
+        if record is not None:
+            cfg = getattr(record.element, "config", {}) or {}
+            callback_url = cfg.get("callback_url") or callback_url
+            callback_events = cfg.get("callback_events") or callback_events
+            correlation_id = cfg.get("correlation_id") or correlation_id
+            namespace = record.namespace or namespace
+
+        if not callback_url:
+            return
+        if callback_events and event not in set(callback_events):
+            return
+
+        body = {
+            "event": event,
+            "namespace": namespace,
+            "correlation_id": correlation_id,
+            "payload": payload,
+            "timestamp": time.time(),
+        }
+
+        def post_callback():
+            data = json.dumps(body).encode("utf-8")
+            request = urllib.request.Request(
+                str(callback_url),
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=1.5) as response:
+                    response.read()
+            except (OSError, urllib.error.URLError, TimeoutError) as exc:
+                self._last_callback_failures.append(
+                    {
+                        "timestamp": time.time(),
+                        "event": event,
+                        "url": str(callback_url),
+                        "message": str(exc),
+                    },
+                )
+                self._last_callback_failures = self._last_callback_failures[-25:]
+
+        threading.Thread(target=post_callback, daemon=True).start()
+
+    def get_diagnostics(self) -> dict:
+        viewport_width, viewport_height = self.get_viewport_size()
+        display = Gdk.Display.get_default()
+        monitors = []
+        if display is not None and hasattr(display, "get_monitors"):
+            model = display.get_monitors()
+            for index in range(model.get_n_items()):
+                monitor = model.get_item(index)
+                if monitor is None:
+                    continue
+                geometry = monitor.get_geometry()
+                monitors.append(
+                    {
+                        "index": index,
+                        "width": int(geometry.width),
+                        "height": int(geometry.height),
+                        "x": int(geometry.x),
+                        "y": int(geometry.y),
+                    }
+                )
+        return {
+            "namespaces": self.list_namespaces()["namespaces"],
+            "elements": {
+                "total": len(self.elements),
+                "transient": len([record for record in self.elements.values() if record.transient]),
+            },
+            "transient_timers": sorted(self._transient_timers.keys()),
+            "interaction": self.get_interaction_status(),
+            "edit_mode": self.editor.is_edit_mode(),
+            "focused": bool(self.has_focus()),
+            "last_api_payloads": list(self._last_api_payloads),
+            "last_callback_failures": list(self._last_callback_failures),
+            "render_failures": list(self._render_failures),
+            "element_failures": list(self._element_failures),
+            "viewport": {"width": viewport_width, "height": viewport_height},
+            "monitors": monitors,
+        }
+
+    def get_namespace_diagnostics(self, namespace: str) -> dict:
+        element_ids = self._namespace_element_ids(namespace)
+        return {
+            "namespace": namespace,
+            "element_count": len(element_ids),
+            "elements": [
+                {
+                    "id": self.elements[elem_id].local_id or elem_id,
+                    "global_id": elem_id,
+                    "type": getattr(self.elements[elem_id].element, "elem_type", None),
+                    "transient": self.elements[elem_id].transient,
+                    "source": self.elements[elem_id].source,
+                }
+                for elem_id in element_ids
+            ],
+            "timer_active": namespace in self._transient_timers,
+        }
+
     def set_edit_mode(self, enabled: bool) -> dict:
         changed = self.editor.set_edit_mode(enabled)
         return {
@@ -969,18 +1312,24 @@ class HudWindow(Gtk.Window):
 
         log.info("Config reloaded: %d elements active", len(self.elements))
 
-    def get_elements_info(self) -> list[dict]:
+    def get_elements_info(self, include_transient: bool = False) -> list[dict]:
         result = []
         for elem_id, record in self.elements.items():
+            if record.transient and not include_transient:
+                continue
             element = record.element
             # Start from original config for full round-trip
             entry = dict(element.config)
+            if record.namespace and record.local_id:
+                entry["id"] = record.local_id
+                entry["namespace"] = record.namespace
             # Overlay current runtime geometry
             entry["position"] = {"x": int(element.position[0]), "y": int(element.position[1])}
             entry["size"] = {"width": int(element.size[0]), "height": int(element.size[1])}
             entry["opacity"] = float(element.opacity)
             entry["__source"] = record.source
             entry["editable"] = record.editable
+            entry["transient"] = record.transient
             result.append(entry)
         return result
 
