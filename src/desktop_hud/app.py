@@ -7,9 +7,13 @@ import os
 import signal
 import sys
 import threading
+import time
+import urllib.error
+import urllib.request
+import json
 from contextlib import contextmanager
 from ctypes import CDLL
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # Must load libgtk4-layer-shell BEFORE any GI imports so it links before libwayland-client
@@ -46,6 +50,9 @@ class ElementRecord:
     frame: Gtk.Widget
     source: str
     editable: bool
+    namespace: str | None = None
+    local_id: str | None = None
+    transient: bool = False
 
 
 class HudWindow(Gtk.Window):
@@ -55,6 +62,13 @@ class HudWindow(Gtk.Window):
         super().__init__(application=app)
         self.config = config
         self.elements: dict[str, ElementRecord] = {}
+        self._transient_timers: dict[str, int] = {}
+        self._interaction: dict | None = None
+        self._interaction_timer: int | None = None
+        self._last_api_payloads: list[dict] = []
+        self._last_callback_failures: list[dict] = []
+        self._render_failures: list[dict] = []
+        self._element_failures: list[dict] = []
         self._autosave_suppression = 0
         self._full_redraw_scheduled = False
 
@@ -69,6 +83,7 @@ class HudWindow(Gtk.Window):
         self._setup_layer_shell()
         self._setup_container()
         self._setup_editor()
+        self._setup_interaction_controller()
         self._load_startup_profiles()
 
         if self.editor.is_edit_mode():
@@ -112,13 +127,17 @@ class HudWindow(Gtk.Window):
     def _refresh_keyboard_mode(self):
         keyboard_mode = (
             LayerShell.KeyboardMode.ON_DEMAND
-            if self.editor.is_edit_mode()
+            if self.editor.is_edit_mode() or self._interaction is not None
             else LayerShell.KeyboardMode.NONE
         )
         LayerShell.set_keyboard_mode(self, keyboard_mode)
 
     def _refresh_input_region(self):
-        effective_click_through = self.base_click_through and not self.editor.is_edit_mode()
+        effective_click_through = (
+            self.base_click_through
+            and not self.editor.is_edit_mode()
+            and self._interaction is None
+        )
         self._set_click_through(effective_click_through)
 
     def _set_click_through(self, enabled: bool):
@@ -175,6 +194,13 @@ class HudWindow(Gtk.Window):
             on_commit=self._on_editor_commit,
             on_mode_changed=self._on_editor_mode_changed,
         )
+
+    def _setup_interaction_controller(self):
+        key_controller = Gtk.EventControllerKey.new()
+        key_controller.connect("key-pressed", self._on_interaction_key_pressed)
+        key_controller.connect("key-released", self._on_interaction_key_released)
+        self.add_controller(key_controller)
+        self._interaction_key_controller = key_controller
 
     def _load_startup_profiles(self):
         """Load elements from startup profiles and last-used geometry."""
@@ -258,6 +284,42 @@ class HudWindow(Gtk.Window):
                 merged[key] = value
         return merged
 
+    @staticmethod
+    def _global_element_id(namespace: str | None, local_id: str) -> str:
+        local = str(local_id).strip()
+        if namespace:
+            return f"{namespace}:{local}"
+        return local
+
+    @staticmethod
+    def _payload_summary(payload: dict, endpoint: str) -> dict:
+        elements = payload.get("elements")
+        return {
+            "endpoint": endpoint,
+            "timestamp": time.time(),
+            "namespace": payload.get("namespace"),
+            "replace_namespace": payload.get("replace_namespace"),
+            "ttl_ms": payload.get("ttl_ms"),
+            "element_count": len(elements) if isinstance(elements, list) else None,
+            "keys": sorted(str(key) for key in payload.keys()),
+        }
+
+    def record_api_payload(self, endpoint: str, payload: dict) -> None:
+        self._last_api_payloads.append(self._payload_summary(payload, endpoint))
+        self._last_api_payloads = self._last_api_payloads[-25:]
+
+    def _record_element_failure(self, elem_id: str, message: str, payload: dict | None = None) -> None:
+        self._element_failures.append(
+            {
+                "timestamp": time.time(),
+                "id": elem_id,
+                "message": message,
+                "type": (payload or {}).get("type"),
+                "namespace": (payload or {}).get("__namespace"),
+            },
+        )
+        self._element_failures = self._element_failures[-50:]
+
     def _recreate_element_widget(self, elem_id: str, merged_config: dict) -> bool:
         """Rebuild an element widget in-place for backend-sensitive config updates."""
         record = self.elements.get(elem_id)
@@ -334,20 +396,26 @@ class HudWindow(Gtk.Window):
         cfg = dict(elem_cfg)
 
         source = cfg.pop("__source", "config")
+        namespace = cfg.pop("__namespace", None)
+        local_id = cfg.pop("__local_id", None)
+        transient = bool(cfg.pop("__transient", False))
         elem_id = cfg.get("id")
         elem_type = cfg.get("type")
 
         if not elem_id or not elem_type:
             log.warning("Element missing id or type: %s", cfg)
+            self._record_element_failure(str(elem_id or ""), "missing id or type", cfg)
             return False
 
         if elem_id in self.elements:
             log.warning("Duplicate element id: %s", elem_id)
+            self._record_element_failure(str(elem_id), "duplicate element id", cfg)
             return False
 
         cls = ELEMENT_TYPES.get(elem_type)
         if cls is None:
             log.warning("Unknown element type '%s' for element '%s'", elem_type, elem_id)
+            self._record_element_failure(str(elem_id), f"unknown element type '{elem_type}'", cfg)
             return False
 
         try:
@@ -390,7 +458,12 @@ class HudWindow(Gtk.Window):
                 frame=frame,
                 source=source,
                 editable=editable,
+                namespace=namespace,
+                local_id=local_id,
+                transient=transient,
             )
+
+            self._attach_runtime_click_callback(elem_id, frame)
 
             # Verify position was actually applied
             from gi.repository import GLib
@@ -413,10 +486,35 @@ class HudWindow(Gtk.Window):
             return True
         except ElementSkipRequested as exc:
             log.info("Skipped element '%s': %s", elem_id, exc)
+            self._record_element_failure(str(elem_id), f"skipped: {exc}", cfg)
             return False
         except Exception:
             log.exception("Failed to create element '%s'", elem_id)
+            self._record_element_failure(str(elem_id), "creation exception", cfg)
             return False
+
+    def _attach_runtime_click_callback(self, elem_id: str, frame: Gtk.Widget) -> None:
+        click = Gtk.GestureClick.new()
+        click.set_button(Gdk.BUTTON_PRIMARY)
+        click.connect("pressed", self._on_runtime_element_clicked, elem_id)
+        frame.add_controller(click)
+
+    def _on_runtime_element_clicked(self, _gesture, _n_press, x, y, elem_id: str) -> None:
+        if self.editor.is_edit_mode():
+            return
+        record = self.elements.get(elem_id)
+        if record is None:
+            return
+        self._emit_callback(
+            "element.clicked",
+            {
+                "id": record.local_id or elem_id,
+                "global_id": elem_id,
+                "x": float(x),
+                "y": float(y),
+            },
+            record=record,
+        )
 
     def remove_element(self, elem_id: str, autosave: bool = True) -> bool:
         record = self.elements.pop(elem_id, None)
