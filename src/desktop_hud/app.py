@@ -70,7 +70,10 @@ class HudWindow(Gtk.Window):
         self._last_callback_failures: list[dict] = []
         self._render_failures: list[dict] = []
         self._element_failures: list[dict] = []
+        self._surface_events: list[dict] = []
         self._autosave_suppression = 0
+        self._surface_visibility_suppression = 0
+        self._pending_visibility_reason: str | None = None
         self._full_redraw_scheduled = False
 
         overlay_cfg = self.config.get("overlay", {})
@@ -177,15 +180,79 @@ class HudWindow(Gtk.Window):
     def _overlay_should_be_visible(self) -> bool:
         return bool(self.elements) or self.editor.is_edit_mode() or self._interaction is not None
 
-    def _sync_overlay_visibility(self) -> None:
+    def _surface_state_summary(self) -> dict:
+        surface = self.get_surface()
+        surface_width = None
+        surface_height = None
+        if surface is not None:
+            try:
+                surface_width = int(surface.get_width())
+                surface_height = int(surface.get_height())
+            except Exception:
+                surface_width = None
+                surface_height = None
+
+        return {
+            "visible": bool(self.get_visible()),
+            "realized": bool(self.get_realized()),
+            "mapped": bool(self.get_mapped()),
+            "focused": bool(self.has_focus()),
+            "surface": surface is not None,
+            "surface_width": surface_width,
+            "surface_height": surface_height,
+            "elements": len(self.elements),
+            "interaction": self._interaction is not None,
+            "edit_mode": self.editor.is_edit_mode(),
+        }
+
+    def _record_surface_event(self, event: str, **details) -> None:
+        entry = {
+            "timestamp": time.time(),
+            "event": event,
+            "state": self._surface_state_summary(),
+        }
+        if details:
+            entry["details"] = details
+        self._surface_events.append(entry)
+        self._surface_events = self._surface_events[-50:]
+
+    def _sync_overlay_visibility(self, reason: str = "sync", force_present: bool = False) -> None:
+        if self._surface_visibility_suppression > 0 and not force_present:
+            self._pending_visibility_reason = reason
+            self._record_surface_event("visibility_sync_deferred", reason=reason)
+            return
+
         should_show = self._overlay_should_be_visible()
+        visible = bool(self.get_visible())
+        self._record_surface_event(
+            "visibility_sync",
+            reason=reason,
+            should_show=should_show,
+            force_present=force_present,
+        )
         if should_show:
-            if not self.get_visible():
+            if not visible:
+                log.info("Overlay window shown because %s requested visible work", reason)
                 self.set_visible(True)
-            self.present()
-        elif self.get_visible():
+                self.present()
+            elif force_present:
+                log.debug("Overlay window presented again because %s requested focus", reason)
+                self.present()
+        elif visible:
             self.set_visible(False)
-            log.info("Overlay window hidden because it has no visible work")
+            log.info("Overlay window hidden because %s left no visible work", reason)
+
+    @contextmanager
+    def _defer_overlay_visibility(self, reason: str):
+        self._surface_visibility_suppression += 1
+        try:
+            yield
+        finally:
+            self._surface_visibility_suppression = max(0, self._surface_visibility_suppression - 1)
+            if self._surface_visibility_suppression == 0:
+                pending_reason = self._pending_visibility_reason
+                self._pending_visibility_reason = None
+                self._sync_overlay_visibility(reason=pending_reason or reason)
 
     def _setup_container(self):
         """Create transparent fixed container for absolute positioning."""
@@ -438,8 +505,6 @@ class HudWindow(Gtk.Window):
 
     def _add_element(self, elem_cfg: dict) -> bool:
         cfg = dict(elem_cfg)
-        if not self.get_visible():
-            self.set_visible(True)
 
         source = cfg.pop("__source", "config")
         namespace = cfg.pop("__namespace", None)
@@ -491,7 +556,23 @@ class HudWindow(Gtk.Window):
                      elem_id, x, y, width, height)
             log.info("Viewport size: %dx%d", *self.get_viewport_size())
 
+            self._record_surface_event(
+                "element_put_start",
+                element_id=str(elem_id),
+                element_type=str(elem_type),
+                source=source,
+                namespace=namespace,
+                transient=transient,
+                frame={"x": x, "y": y, "width": width, "height": height},
+            )
             self.container.put(frame, x, y)
+            self._record_surface_event(
+                "element_put_done",
+                element_id=str(elem_id),
+                element_type=str(elem_type),
+                source=source,
+                namespace=namespace,
+            )
 
             element.position = (x, y)
             element.size = (width, height)
@@ -509,14 +590,23 @@ class HudWindow(Gtk.Window):
 
             self._attach_runtime_click_callback(elem_id, frame)
             self._attach_widget_action_callbacks(elem_id, content_widget)
-            self._sync_overlay_visibility()
+            self._sync_overlay_visibility(reason=f"element_added:{elem_id}")
 
             # Verify position was actually applied
-            from gi.repository import GLib
             def verify_position():
                 alloc = frame.get_allocation()
                 log.info("Element '%s' actual allocation: x=%d, y=%d, width=%d, height=%d",
                          elem_id, alloc.x, alloc.y, alloc.width, alloc.height)
+                self._record_surface_event(
+                    "element_allocation",
+                    element_id=str(elem_id),
+                    allocation={
+                        "x": int(alloc.x),
+                        "y": int(alloc.y),
+                        "width": int(alloc.width),
+                        "height": int(alloc.height),
+                    },
+                )
                 return False
             GLib.idle_add(verify_position)
 
@@ -625,7 +715,7 @@ class HudWindow(Gtk.Window):
         self.container.queue_draw()
         self.queue_draw()
         log.info("Removed element '%s'", elem_id)
-        self._sync_overlay_visibility()
+        self._sync_overlay_visibility(reason=f"element_removed:{elem_id}")
 
         if autosave:
             self._maybe_autosave_last_used()
@@ -687,10 +777,9 @@ class HudWindow(Gtk.Window):
 
         added: list[str] = []
         failed: list[dict] = []
-        with self._suspend_autosave():
+        with self._suspend_autosave(), self._defer_overlay_visibility(f"namespace_changed:{namespace}"):
             if replace:
                 self._cancel_transient_timer(namespace)
-            if replace:
                 for elem_id in self._namespace_element_ids(namespace):
                     self.remove_element(elem_id, autosave=False)
             for raw in elements:
@@ -774,14 +863,13 @@ class HudWindow(Gtk.Window):
     def delete_namespace(self, namespace: str, autosave: bool = True) -> dict:
         namespace = str(namespace).strip()
         removed = []
-        with self._suspend_autosave():
+        with self._suspend_autosave(), self._defer_overlay_visibility(f"namespace_deleted:{namespace}"):
             for elem_id in self._namespace_element_ids(namespace):
                 if self.remove_element(elem_id, autosave=False):
                     removed.append(elem_id)
         self._cancel_transient_timer(namespace)
         self.container.queue_draw()
         self.queue_draw()
-        self._sync_overlay_visibility()
         if autosave:
             self._maybe_autosave_last_used()
         return {"ok": True, "namespace": namespace, "removed": len(removed)}
@@ -1003,7 +1091,7 @@ class HudWindow(Gtk.Window):
     def _on_editor_mode_changed(self, enabled: bool) -> None:
         self._refresh_keyboard_mode()
         self._refresh_input_region()
-        self._sync_overlay_visibility()
+        self._sync_overlay_visibility(reason="editor_mode_changed", force_present=enabled)
         if enabled:
             try:
                 self.set_focusable(True)
@@ -1120,7 +1208,7 @@ class HudWindow(Gtk.Window):
         }
         self.set_focusable(True)
         self._refresh_keyboard_mode()
-        self.present()
+        self._sync_overlay_visibility(reason="grab_interaction", force_present=True)
         try:
             focused = bool(self.grab_focus())
         except Exception:
@@ -1160,7 +1248,7 @@ class HudWindow(Gtk.Window):
             self.delete_namespace(str(namespace_to_clear), autosave=False)
         self._refresh_keyboard_mode()
         self._refresh_input_region()
-        self._sync_overlay_visibility()
+        self._sync_overlay_visibility(reason=f"interaction_released:{reason}")
         log.info(
             "Released interaction reason=%s was_active=%s cleared_namespace=%s",
             reason,
@@ -1289,6 +1377,8 @@ class HudWindow(Gtk.Window):
             "last_callback_failures": list(self._last_callback_failures),
             "render_failures": list(self._render_failures),
             "element_failures": list(self._element_failures),
+            "surface_events": list(self._surface_events),
+            "surface_state": self._surface_state_summary(),
             "viewport": viewport_info["viewport"],
             "monitors": viewport_info["monitors"],
         }
@@ -1381,7 +1471,7 @@ class HudWindow(Gtk.Window):
                 "message": f"Could not load profile '{name}'",
             }
 
-        with self._suspend_autosave():
+        with self._suspend_autosave(), self._defer_overlay_visibility(f"profile_switched:{name}"):
             for elem_id in list(self.elements.keys()):
                 self.remove_element(elem_id, autosave=False)
 
@@ -1414,7 +1504,7 @@ class HudWindow(Gtk.Window):
                 "message": str(exc),
             }
 
-        with self._suspend_autosave():
+        with self._suspend_autosave(), self._defer_overlay_visibility(f"profile_added:{name}"):
             for elem_cfg in elements:
                 elem_id = elem_cfg.get("id")
                 if elem_id and elem_id in self.elements:
@@ -1509,7 +1599,7 @@ class HudWindow(Gtk.Window):
         self.editor.hotkey = self.editor._parse_hotkey(self.editor.hotkey_spec)
 
         # Re-load active profiles
-        with self._suspend_autosave():
+        with self._suspend_autosave(), self._defer_overlay_visibility("config_reloaded"):
             for elem_id in list(self.elements.keys()):
                 self.remove_element(elem_id, autosave=False)
 
@@ -1524,7 +1614,7 @@ class HudWindow(Gtk.Window):
         self.editor.set_edit_mode(bool(self.config.get("overlay", {}).get("edit_mode", False)))
         self.editor.refresh_all()
         self._refresh_input_region()
-        self._sync_overlay_visibility()
+        self._sync_overlay_visibility(reason="config_reloaded")
         self._maybe_autosave_last_used()
 
         log.info("Config reloaded: %d elements active", len(self.elements))
@@ -1588,7 +1678,7 @@ class HudApplication(Gtk.Application):
             config.setdefault("layouts", {})["autosave_last_used"] = False
 
         self.window = HudWindow(self, config)
-        self.window._sync_overlay_visibility()
+        self.window._sync_overlay_visibility(reason="application_activated")
 
         api_cfg = config.get("api", {})
         if api_cfg.get("enabled", False):
