@@ -1187,18 +1187,54 @@ class HudWindow(Gtk.Window):
 
     def grab_interaction(self, payload: dict) -> dict:
         namespace = str(payload.get("namespace", "")).strip() or None
+        correlation_id = payload.get("correlation_id")
+        timeout_ms = int(payload.get("timeout_ms", payload.get("ttl_ms", 10000)))
+        timeout_ms = max(100, timeout_ms)
+
         if self._interaction is not None:
+            same_interaction = (
+                namespace
+                and namespace == self._interaction.get("namespace")
+                and correlation_id == self._interaction.get("correlation_id")
+            )
+            if same_interaction:
+                self._interaction.update(
+                    {
+                        "callback_url": payload.get("callback_url"),
+                        "callback_events": payload.get("callback_events") or [],
+                        "escape_releases": bool(payload.get("escape_releases", True)),
+                        "clear_namespace_on_release": bool(payload.get("clear_namespace_on_release", False)),
+                        "keyboard_mode": str(payload.get("keyboard_mode", "exclusive")),
+                        "started_at": time.time(),
+                        "timeout_ms": timeout_ms,
+                        "last_event": None,
+                    }
+                )
+                self.set_focusable(True)
+                self._refresh_keyboard_mode()
+                self._sync_overlay_visibility(reason="renew_interaction", force_present=True)
+                try:
+                    focused = bool(self.grab_focus())
+                except Exception:
+                    focused = False
+                self._refresh_input_region()
+                self._start_interaction_timer(timeout_ms)
+                return {
+                    "ok": True,
+                    "renewed": True,
+                    "focused": focused or bool(self.has_focus()),
+                    "interaction": self.get_interaction_status(),
+                }
+
             if namespace and namespace == self._interaction.get("namespace"):
                 self._interaction["clear_namespace_on_release"] = False
             self.release_interaction("replaced")
 
-        timeout_ms = int(payload.get("timeout_ms", payload.get("ttl_ms", 10000)))
-        timeout_ms = max(100, timeout_ms)
         self._interaction = {
             "namespace": namespace,
             "callback_url": payload.get("callback_url"),
             "callback_events": payload.get("callback_events") or [],
-            "correlation_id": payload.get("correlation_id"),
+            "correlation_id": correlation_id,
             "escape_releases": bool(payload.get("escape_releases", True)),
             "clear_namespace_on_release": bool(payload.get("clear_namespace_on_release", False)),
             "keyboard_mode": str(payload.get("keyboard_mode", "exclusive")),
@@ -1214,6 +1250,20 @@ class HudWindow(Gtk.Window):
         except Exception:
             focused = False
         self._refresh_input_region()
+        self._start_interaction_timer(timeout_ms)
+        return {
+            "ok": True,
+            "focused": focused or bool(self.has_focus()),
+            "interaction": self.get_interaction_status(),
+        }
+
+    def _start_interaction_timer(self, timeout_ms: int) -> None:
+        if self._interaction_timer is not None:
+            try:
+                GLib.source_remove(self._interaction_timer)
+            except Exception:
+                log.debug("Interaction timer %s was already removed", self._interaction_timer)
+            self._interaction_timer = None
 
         def timeout_release():
             if self._interaction is not None:
@@ -1222,11 +1272,15 @@ class HudWindow(Gtk.Window):
             return False
 
         self._interaction_timer = int(GLib.timeout_add(timeout_ms, timeout_release))
-        return {
-            "ok": True,
-            "focused": focused or bool(self.has_focus()),
-            "interaction": self.get_interaction_status(),
-        }
+
+    def _refresh_interaction_timer(self) -> None:
+        if self._interaction is None:
+            return
+        timeout_ms = int(self._interaction.get("timeout_ms", 0))
+        if timeout_ms <= 0:
+            return
+        self._interaction["started_at"] = time.time()
+        self._start_interaction_timer(timeout_ms)
 
     def release_interaction(self, reason: str = "released") -> dict:
         was_active = self._interaction is not None
@@ -1293,6 +1347,7 @@ class HudWindow(Gtk.Window):
         if keyval == Gdk.KEY_Escape and self._interaction.get("escape_releases", True):
             self.release_interaction("escape")
             return True
+        self._refresh_interaction_timer()
         self._emit_callback("interaction.key_pressed", payload)
         return True
 

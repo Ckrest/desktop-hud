@@ -93,6 +93,8 @@ class ListElement(HudElement):
         state = _text(row.get("state"), "default").strip().lower()
         if state and state != "default":
             button.add_css_class(f"hud-list-row-{state}")
+        if row.get("selected"):
+            button.add_css_class("hud-list-row-selected")
         action_id = row.get("action_id") or row.get("action")
         if action_id:
             button.set_name(str(action_id))

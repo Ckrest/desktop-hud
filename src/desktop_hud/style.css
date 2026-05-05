@@ -116,6 +116,11 @@ window {
     background-color: rgba(51, 65, 85, 0.72);
 }
 
+.hud-list-row-selected {
+    background-color: rgba(37, 99, 235, 0.74);
+    border-color: rgba(147, 197, 253, 0.9);
+}
+
 .hud-list-key {
     color: rgba(255, 255, 255, 0.95);
     background-color: rgba(15, 23, 42, 0.86);
